@@ -9,6 +9,7 @@ import os
 import json
 
 # Import the refactored functions from your modules
+# Ensure these modules are in the same directory as api.py
 from audience_analyser import process_audiences, load_json, CAMPAIGN_STRATEGY_PATH
 from growth_levers import process_growth_levers
 from campaign_generator import process_campaign_ideas
@@ -22,12 +23,13 @@ app = FastAPI(
 
 # --- CORS Middleware ---
 # This allows your frontend (e.g., React app running on localhost:3000) to make requests to this API.
+# For production, replace "*" with specific frontend URLs (e.g., ["https://reactjs-a4hv.onrender.com", "http://localhost:3000"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this to your frontend's actual origin(s) in production (e.g., ["http://localhost:3000"])
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, PUT, DELETE, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- Request Body Models for API Endpoints ---
@@ -66,13 +68,24 @@ class FlowModifyRequest(BaseModel):
 
 # --- API Endpoints ---
 
+@app.get("/")
+async def read_root():
+    """
+    A simple root endpoint to confirm the API is running.
+    """
+    return {"message": "Campaign Strategy API is running!"}
+
 @app.get("/strategy", response_class=JSONResponse)
 async def get_campaign_strategy():
     """
     Retrieves the entire campaign_strategy.json.
     """
-    strategy = load_json(CAMPAIGN_STRATEGY_PATH)
-    return strategy
+    try:
+        strategy = load_json(CAMPAIGN_STRATEGY_PATH)
+        return strategy
+    except Exception as e:
+        # Include the exception message for better debugging
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve campaign strategy: {e}")
 
 @app.post("/audiences", response_model=Dict[str, Any])
 async def post_audiences(request: AudienceRequest):
@@ -90,6 +103,7 @@ async def post_audiences(request: AudienceRequest):
         )
         return updated_audiences
     except Exception as e:
+        # Include the exception message for better debugging
         raise HTTPException(status_code=500, detail=f"Failed to process audiences: {e}")
 
 @app.post("/growth-levers", response_model=Dict[str, Any])
@@ -108,6 +122,7 @@ async def post_growth_levers(request: GrowthLeverRequest):
         )
         return updated_levers
     except Exception as e:
+        # Include the exception message for better debugging
         raise HTTPException(status_code=500, detail=f"Failed to process growth levers: {e}")
 
 @app.post("/campaign-ideas", response_model=Dict[str, Any])
@@ -186,13 +201,5 @@ async def post_flows(request: Request):
     else:
         raise HTTPException(status_code=400, detail="Invalid action. Must be 'generate' or 'modify'.")
 
-# --- Run the FastAPI App ---
-if __name__ == "__main__":
-    # To run this API:
-    # 1. Make sure you have uvicorn installed: pip install uvicorn
-    # 2. Save this file as api.py
-    # 3. Run from your terminal in the same directory: uvicorn api:app --reload --port 8000
-    #    --reload is useful for development as it restarts the server on code changes.
-    #    --port 8000 specifies the port.
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
-
+# The if __name__ == "__main__": block is removed for production deployment with Gunicorn
+# uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
