@@ -4,3 +4,4 @@ pydantic
 python-dotenv # For os.getenv to read environment variables (good practice though not directly imported as `dotenv`)
 langchain-core
 langchain-openai
+supabase
