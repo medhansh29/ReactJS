@@ -47,14 +47,20 @@ class GrowthLevers(BaseModel):
 
 # --- Supabase Helper Functions ---
 
-async def fetch_from_supabase(table_name: str) -> List[Dict[str, Any]]:
-    """Fetches data from a specified Supabase table."""
+async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Fetches data from a specified Supabase table, optionally by ID.
+    Added id parameter to allow fetching specific records, reducing data loaded.
+    """
     try:
-        response = supabase.from_(table_name).select('*').execute()
+        query = supabase.from_(table_name).select('*')
+        if id:
+            query = query.eq('id', id)
+        response = query.execute()
         if response and hasattr(response, 'data'):
-            print(f"Successfully fetched data from {table_name}. Number of records: {len(response.data)}")
+            # print(f"Successfully fetched data from {table_name}. Number of records: {len(response.data)}")
             return response.data
-        print(f"Warning: No data found in {table_name}.")
+        # print(f"Warning: No data found in {table_name}.")
         return []
     except Exception as e:
         print(f"Error fetching data from Supabase table {table_name}: {e}")
@@ -98,36 +104,38 @@ async def delete_from_supabase(table_name: str, id: str) -> None:
 async def call_llm_for_growth_levers(
     prompt_text: str,
     api_key: str,
-    all_data_context: Dict,
-    current_growth_levers_for_llm: Optional[List[Dict[str, Any]]] = None # Changed type to Any as it includes 'id'
-) -> List[Dict[str, Any]]: # Changed return type to Any
-    """Calls the OpenAI LLM for growth lever generation/modification."""
-    llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key) if api_key else None)
+    product_summary: str, # New: summarized product data
+    customer_demographics_summary: str, # New: summarized customer demographics
+    campaign_performance_summary: str, # New: summarized campaign performance
+    audience_types_summary: str, # New: summarized audience types
+    current_growth_levers_for_llm: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
+    """Calls the OpenAI LLM for growth lever generation/modification, with reduced context."""
+    llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key)) 
     parser = PydanticOutputParser(pydantic_object=GrowthLevers)
     format_instructions = parser.get_format_instructions()
 
-    # campaign_performance will now be an empty list if no data exists for it, or contain data if available
-    data_context_str = f"""
-Product Data: {json.dumps(all_data_context.get('product_data', []), indent=2)}
-Customer Data: {json.dumps(all_data_context.get('customer_data', []), indent=2)}
-Campaign Performance Data: {json.dumps(all_data_context.get('campaign_performance', []), indent=2)}
-Generated Audience Types: {json.dumps(all_data_context.get('audience_types', []), indent=2)}
-    """
-
     template_variables = {
-        "data_context_str": data_context_str,
         "format_instructions_var": format_instructions,
+        "product_summary": product_summary,
+        "customer_demographics_summary": customer_demographics_summary,
+        "campaign_performance_summary": campaign_performance_summary,
+        "audience_types_summary": audience_types_summary,
     }
 
     if current_growth_levers_for_llm:
         full_prompt_template_str = """
-        Based on the following data and the current growth lever suggestions, please provide an updated list.
+        Based on the following summarized data and the current growth lever suggestions, please provide an updated list.
         The user's request for modification is: "{user_modification_prompt}"
 
         Current Growth Levers:
         {current_growth_levers_json}
 
-        {data_context_str}
+        Limited Context Data:
+        Product Summary: {product_summary}
+        Customer Demographics Summary: {customer_demographics_summary}
+        Campaign Performance Summary: {campaign_performance_summary}
+        Generated Audience Types Summary: {audience_types_summary}
 
         Modify the growth levers based on the user's request. Maintain the JSON array format as specified by the output instructions.
         If a lever needs to be removed, omit it. If a new lever is requested, add it.
@@ -141,19 +149,23 @@ Generated Audience Types: {json.dumps(all_data_context.get('audience_types', [])
         template_variables["current_growth_levers_json"] = json.dumps(current_growth_levers_for_llm, indent=2)
     else:
         full_prompt_template_str = """
-        Based on the provided product data, customer data, campaign performance, and the generated audience types,
+        Based on the provided summarized product data, customer demographics, campaign performance, and generated audience types,
         suggest 3-5 distinct growth levers. If the user has a specific idea for a growth lever, incorporate it
         and suggest related ones. For each lever, provide:
         - A concise 'type' (e.g., 'Targeted Ad Campaign', 'Product Bundling', 'Customer Loyalty Program').
         - 'Details' outlining specific actions or strategies.
         - 'Rationale' explaining why this lever is suitable for the business and target audiences,
-          referencing the provided data.
+          referencing the provided summarized data.
         - If the growth lever involves a specific discount, include 'exact_discount_percentage' (e.g., 10.5 for 10.5%). Set to null if not applicable.
         - The 'id' field should be omitted or set to null for new growth levers.
 
         User's specific idea (if any): "{user_initial_prompt}"
 
-        {data_context_str}
+        Limited Context Data:
+        Product Summary: {product_summary}
+        Customer Demographics Summary: {customer_demographics_summary}
+        Campaign Performance Summary: {campaign_performance_summary}
+        Generated Audience Types Summary: {audience_types_summary}
 
         Ensure the output strictly adheres to the JSON schema.
 
@@ -180,24 +192,23 @@ async def process_growth_levers(
     Returns the updated list of growth lever records from Supabase.
     """
     # Fetch all necessary data from Supabase for context
-    product_data = await fetch_from_supabase('product_store')
-    customer_data = await fetch_from_supabase('cohort_store') # Assuming customer data is in cohort_store or similar
+    product_data_raw = await fetch_from_supabase('product_store')
+    customer_data_raw = await fetch_from_supabase('cohort_store') # Assuming customer data is in cohort_store or similar
+    campaign_performance_raw = await fetch_from_supabase('campaign_performance_store') 
+    audience_types_raw = await fetch_from_supabase('audience_store') # Get audiences from audience_store
+
+    # --- Summarize Contextual Data for LLM ---
+    product_summary = "Available products: " + ", ".join([p.get('name', '') for p in product_data_raw[:5]]) + "..." if product_data_raw else "No product data."
+    customer_demographics_summary = "Customer cohorts include: " + ", ".join([c.get('cohort_name', '') for c in customer_data_raw[:5]]) + " with varying sizes." if customer_data_raw else "No customer demographics."
+    campaign_performance_summary = "Recent campaign performance (top 2): " + json.dumps(campaign_performance_raw[:2], indent=2) + "..." if campaign_performance_raw else "No campaign performance data."
+    audience_types_summary = "Generated audience types (top 3): " + ", ".join([a.get('title', '') for a in audience_types_raw[:3]]) + "..." if audience_types_raw else "No audience types generated."
     
-    # Reinstated fetch for campaign_performance_store; fetch_from_supabase handles empty tables
-    campaign_performance = await fetch_from_supabase('campaign_performance_store') 
-
-    audience_types = await fetch_from_supabase('audience_store') # Get audiences from audience_store
-
-    print(f"DEBUG: Fetched {len(product_data)} product records.")
-    print(f"DEBUG: Fetched {len(customer_data)} customer records (from cohort_store).")
-    print(f"DEBUG: Fetched {len(campaign_performance)} campaign performance records (from campaign_performance_store).")
-    print(f"DEBUG: Fetched {len(audience_types)} audience records.")
-
     current_growth_levers_from_db = await fetch_from_supabase('growth_levers_store')
     
     if growth_lever_id_to_affect: # Handling singular update/delete
         if user_prompt.lower().strip() == "delete":
             await delete_from_supabase('growth_levers_store', growth_lever_id_to_affect)
+            print(f"Growth Lever {growth_lever_id_to_affect} deleted.")
             return await fetch_from_supabase('growth_levers_store') # Return updated list after deletion
         else: # Singular update
             # Find the specific growth lever to update
@@ -207,12 +218,10 @@ async def process_growth_levers(
                 llm_response_list = await call_llm_for_growth_levers(
                     prompt_text=user_prompt,
                     api_key=API_KEY or "",
-                    all_data_context={
-                        'product_data': product_data,
-                        'customer_data': customer_data,
-                        'campaign_performance': campaign_performance, 
-                        'audience_types': audience_types
-                    },
+                    product_summary=product_summary,
+                    customer_demographics_summary=customer_demographics_summary,
+                    campaign_performance_summary=campaign_performance_summary, 
+                    audience_types_summary=audience_types_summary,
                     current_growth_levers_for_llm=[growth_lever_to_update] # Pass the single lever for modification
                 )
                 if llm_response_list:
@@ -251,12 +260,10 @@ async def process_growth_levers(
     suggested_growth_levers_raw = await call_llm_for_growth_levers(
         prompt_text=user_prompt,
         api_key=API_KEY or "",
-        all_data_context={
-            'product_data': product_data,
-            'customer_data': customer_data,
-            'campaign_performance': campaign_performance, 
-            'audience_types': audience_types
-        },
+        product_summary=product_summary,
+        customer_demographics_summary=customer_demographics_summary,
+        campaign_performance_summary=campaign_performance_summary, 
+        audience_types_summary=audience_types_summary,
         current_growth_levers_for_llm=growth_levers_for_llm_context # Pass existing levers for LLM context
     )
 
