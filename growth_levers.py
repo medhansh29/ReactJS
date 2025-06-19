@@ -31,7 +31,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 class GrowthLever(BaseModel):
     """Represents a suggested growth lever with its type, details, and rationale."""
-    # Added 'id' field for consistency with Supabase storage and modification
+    # Added 'id' field for consistency with UI memory and modification
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique ID for the growth lever.")
     type: str = Field(description="The type of growth lever (e.g., 'Marketing Channel Expansion', 'Product Feature Enhancement').")
     details: str = Field(description="Specific details and actions for implementing this growth lever.")
@@ -45,12 +45,12 @@ class GrowthLevers(BaseModel):
     """A list of suggested growth levers."""
     growth_levers: List[GrowthLever] = Field(description="A list of distinct growth levers.")
 
-# --- Supabase Helper Functions ---
+# --- Supabase Helper Functions (Only fetch for contextual read-only data) ---
 
 async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Fetches data from a specified Supabase table, optionally by ID.
-    Added id parameter to allow fetching specific records, reducing data loaded.
+    This function is retained only for fetching *read-only* contextual data.
     """
     try:
         query = supabase.from_(table_name).select('*')
@@ -58,46 +58,15 @@ async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List
             query = query.eq('id', id)
         response = query.execute()
         if response and hasattr(response, 'data'):
-            # print(f"Successfully fetched data from {table_name}. Number of records: {len(response.data)}")
             return response.data
-        # print(f"Warning: No data found in {table_name}.")
         return []
     except Exception as e:
-        print(f"Error fetching data from Supabase table {table_name}: {e}")
+        # Removed print statement for production readiness
         return []
 
-async def insert_into_growth_levers_store(data: List[Dict]) -> None:
-    """Inserts data into the growth_levers_store Supabase table."""
-    try:
-        response = supabase.from_('growth_levers_store').insert(data).execute()
-        if response and hasattr(response, 'data'):
-            print(f"Successfully inserted {len(response.data)} records into growth_levers_store.")
-        else:
-            print(f"No data returned on insert to growth_levers_store, but request sent.")
-    except Exception as e:
-        print(f"Error inserting data into growth_levers_store: {e}")
-
-async def update_growth_levers_store(id: str, data: Dict) -> None:
-    """Updates a record in the growth_levers_store Supabase table."""
-    try:
-        response = supabase.from_('growth_levers_store').update(data).eq('id', id).execute()
-        if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully updated record {id} in growth_levers_store.")
-        else:
-            print(f"No data returned on update for id {id}, but request sent or no matching id found.")
-    except Exception as e:
-        print(f"Error updating record {id} in growth_levers_store: {e}")
-
-async def delete_from_supabase(table_name: str, id: str) -> None:
-    """Deletes a record from a specified Supabase table by ID."""
-    try:
-        response = supabase.from_(table_name).delete().eq('id', id).execute()
-        if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully deleted record {id} from {table_name}.")
-        else:
-            print(f"No data returned on delete for id {id} from {table_name}, but request sent or no matching id found.")
-    except Exception as e:
-        print(f"Error deleting record {id} from {table_name}: {e}")
+# Removed insert_into_growth_levers_store
+# Removed update_growth_levers_store
+# Removed delete_from_supabase (as it was only used for growth_levers_store in this file)
 
 # --- LLM Call Function ---
 
@@ -108,7 +77,7 @@ async def call_llm_for_growth_levers(
     customer_demographics_summary: str, # New: summarized customer demographics
     campaign_performance_summary: str, # New: summarized campaign performance
     audience_types_summary: str, # New: summarized audience types
-    current_growth_levers_for_llm: Optional[List[Dict[str, Any]]] = None
+    current_growth_levers_for_llm: Optional[List[Dict[str, Any]]] = None # Current state from UI memory
 ) -> List[Dict[str, Any]]:
     """Calls the OpenAI LLM for growth lever generation/modification, with reduced context."""
     llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key)) 
@@ -179,23 +148,25 @@ async def call_llm_for_growth_levers(
         response = await chain.ainvoke(template_variables)
         return [gl.model_dump(by_alias=True) for gl in response.growth_levers] # Use by_alias to match field names
     except Exception as e:
-        print(f"Error during LLM growth lever call: {e}")
+        # print(f"Error during LLM growth lever call: {e}") # Removed print for production
         return []
 
 async def process_growth_levers(
     user_prompt: str,
-    is_modification: bool = False,
+    # current_growth_levers will now be passed from UI's session memory
+    current_growth_levers: List[Dict[str, Any]], 
+    action_type: str, # 'generate', 'update_singular', 'delete_singular'
     growth_lever_id_to_affect: Optional[str] = None # For singular update/delete
-) -> List[Dict[str, Any]]: # Returns list of Dicts, not Dict
+) -> List[Dict[str, Any]]: # Returns list of Dicts (the updated state for UI memory)
     """
-    Generates, modifies, updates, or deletes growth levers and updates the growth_levers_store Supabase table.
-    Returns the updated list of growth lever records from Supabase.
+    Generates, modifies, or deletes growth levers in memory.
+    Returns the updated list of growth lever records for UI session memory.
     """
-    # Fetch all necessary data from Supabase for context
+    # Fetch all necessary data from Supabase for *read-only* context
     product_data_raw = await fetch_from_supabase('product_store')
-    customer_data_raw = await fetch_from_supabase('cohort_store') # Assuming customer data is in cohort_store or similar
+    customer_data_raw = await fetch_from_supabase('cohort_store') 
     campaign_performance_raw = await fetch_from_supabase('campaign_performance_store') 
-    audience_types_raw = await fetch_from_supabase('audience_store') # Get audiences from audience_store
+    audience_types_raw = await fetch_from_supabase('audience_store') 
 
     # --- Summarize Contextual Data for LLM ---
     product_summary = "Available products: " + ", ".join([p.get('name', '') for p in product_data_raw[:5]]) + "..." if product_data_raw else "No product data."
@@ -203,172 +174,65 @@ async def process_growth_levers(
     campaign_performance_summary = "Recent campaign performance (top 2): " + json.dumps(campaign_performance_raw[:2], indent=2) + "..." if campaign_performance_raw else "No campaign performance data."
     audience_types_summary = "Generated audience types (top 3): " + ", ".join([a.get('title', '') for a in audience_types_raw[:3]]) + "..." if audience_types_raw else "No audience types generated."
     
-    current_growth_levers_from_db = await fetch_from_supabase('growth_levers_store')
-    
-    if growth_lever_id_to_affect: # Handling singular update/delete
-        if user_prompt.lower().strip() == "delete":
-            await delete_from_supabase('growth_levers_store', growth_lever_id_to_affect)
-            print(f"Growth Lever {growth_lever_id_to_affect} deleted.")
-            return await fetch_from_supabase('growth_levers_store') # Return updated list after deletion
-        else: # Singular update
-            # Find the specific growth lever to update
-            growth_lever_to_update = next((gl for gl in current_growth_levers_from_db if gl.get('id') == growth_lever_id_to_affect), None)
-            if growth_lever_to_update:
-                # Use LLM to generate a single updated growth lever based on prompt
-                llm_response_list = await call_llm_for_growth_levers(
-                    prompt_text=user_prompt,
-                    api_key=API_KEY or "",
-                    product_summary=product_summary,
-                    customer_demographics_summary=customer_demographics_summary,
-                    campaign_performance_summary=campaign_performance_summary, 
-                    audience_types_summary=audience_types_summary,
-                    current_growth_levers_for_llm=[growth_lever_to_update] # Pass the single lever for modification
-                )
-                if llm_response_list:
-                    updated_gl_data = llm_response_list[0] # Expecting only one modified lever
-                    
-                    # Ensure the ID from the database is preserved
-                    updated_gl_data['id'] = growth_lever_id_to_affect 
+    # current_growth_levers_from_db is now `current_growth_levers` passed from the UI
+    updated_levers_list = list(current_growth_levers) # Create a mutable copy
 
-                    # Prepare data to update (remove any fields not matching DB schema if necessary)
-                    data_to_update = {
-                        "id": updated_gl_data.get('id'),
-                        "type": updated_gl_data.get('type'),
-                        "details": updated_gl_data.get('details'),
-                        "rationale": updated_gl_data.get('rationale'),
-                        "exact_discount_percentage": updated_gl_data.get('exact_discount_percentage')
-                    }
-                    await update_growth_levers_store(growth_lever_id_to_affect, data_to_update)
-                    print(f"\n--- Updated Single Growth Lever (ID: {growth_lever_id_to_affect}) ---")
-                    print(f"Type: {data_to_update.get('type')}")
-                    print(f"Details: {data_to_update.get('details')}")
-                    print(f"Rationale: {data_to_update.get('rationale')}")
-                    print(f"Discount: {data_to_update.get('exact_discount_percentage')}")
-                    print("-" * 30)
-                    return await fetch_from_supabase('growth_levers_store') # Return updated list
-                else:
-                    print(f"Could not generate update for growth lever ID {growth_lever_id_to_affect}.")
-            else:
-                print(f"Growth Lever with ID {growth_lever_id_to_affect} not found for update.")
-            return await fetch_from_supabase('growth_levers_store') # Return current list if update failed
+    if action_type == "delete_singular":
+        if growth_lever_id_to_affect:
+            updated_levers_list = [gl for gl in updated_levers_list if gl.get('id') != growth_lever_id_to_affect]
+            # print(f"Growth Lever {growth_lever_id_to_affect} deleted from session.") # Removed print
+        return updated_levers_list
 
-    # Handling general generation or modification (multiple growth levers via LLM's full generation)
-    growth_levers_for_llm_context = None
-    if is_modification: # If it's a modification request, provide current levers to LLM
-        growth_levers_for_llm_context = current_growth_levers_from_db
+    elif action_type == "update_singular":
+        if not growth_lever_id_to_affect:
+            # print("No growth lever ID provided for singular update.") # Removed print
+            return updated_levers_list
 
-    suggested_growth_levers_raw = await call_llm_for_growth_levers(
-        prompt_text=user_prompt,
-        api_key=API_KEY or "",
-        product_summary=product_summary,
-        customer_demographics_summary=customer_demographics_summary,
-        campaign_performance_summary=campaign_performance_summary, 
-        audience_types_summary=audience_types_summary,
-        current_growth_levers_for_llm=growth_levers_for_llm_context # Pass existing levers for LLM context
-    )
-
-    if suggested_growth_levers_raw:
-        # Create a map of existing growth levers by their ID for efficient lookup during update/insert
-        existing_levers_map = {gl.get('id'): gl for gl in current_growth_levers_from_db if gl.get('id')}
-        
-        levers_to_keep_ids = set() # Track IDs of growth levers that are still present or newly added
-        data_to_insert = []
-        
-        for suggested_gl in suggested_growth_levers_raw:
-            gl_id = suggested_gl.get('id')
-            
-            data_to_process = {
-                "type": suggested_gl.get('type'),
-                "details": suggested_gl.get('details'),
-                "rationale": suggested_gl.get('rationale'),
-                "exact_discount_percentage": suggested_gl.get('exact_discount_percentage')
-            }
-
-            if gl_id and gl_id in existing_levers_map:
-                # Update existing growth lever
-                await update_growth_levers_store(str(gl_id), data_to_process)
-                levers_to_keep_ids.add(gl_id)
-            else:
-                # Insert new growth lever (assign a new UUID)
-                new_id = str(uuid.uuid4())
-                data_to_process['id'] = new_id
-                data_to_insert.append(data_to_process)
-                levers_to_keep_ids.add(new_id)
-        
-        if data_to_insert:
-            await insert_into_growth_levers_store(data_to_insert)
-        
-        # Delete growth levers that were in DB but not returned by LLM (meaning they should be removed)
-        if is_modification: # Only delete if it was a modification prompt to the LLM
-            for existing_gl in current_growth_levers_from_db:
-                if existing_gl.get('id') not in levers_to_keep_ids:
-                    await delete_from_supabase('growth_levers_store', existing_gl.get('id', ''))
-
-        updated_growth_levers = await fetch_from_supabase('growth_levers_store')
-        
-        print("\n--- Generated/Modified Growth Levers ---")
-        if updated_growth_levers:
-            for gl in updated_growth_levers:
-                print(f"ID: {gl.get('id')}")
-                print(f"Type: {gl.get('type')}")
-                print(f"Details: {gl.get('details')}")
-                print(f"Rationale: {gl.get('rationale')}")
-                print(f"Discount: {gl.get('exact_discount_percentage')}")
-                print("-" * 30)
+        growth_lever_to_update = next((gl for gl in updated_levers_list if gl.get('id') == growth_lever_id_to_affect), None)
+        if growth_lever_to_update:
+            llm_response_list = await call_llm_for_growth_levers(
+                prompt_text=user_prompt,
+                api_key=API_KEY or "",
+                product_summary=product_summary,
+                customer_demographics_summary=customer_demographics_summary,
+                campaign_performance_summary=campaign_performance_summary, 
+                audience_types_summary=audience_types_summary,
+                current_growth_levers_for_llm=[growth_lever_to_update] # Pass the single lever for modification
+            )
+            if llm_response_list:
+                updated_gl_data = llm_response_list[0] 
+                # Find index and replace
+                for i, gl in enumerate(updated_levers_list):
+                    if gl.get('id') == growth_lever_id_to_affect:
+                        updated_gl_data['id'] = growth_lever_id_to_affect # Preserve ID
+                        updated_levers_list[i] = updated_gl_data
+                        # print(f"Updated Growth Lever {growth_lever_id_to_affect} in session.") # Removed print
+                        break
         else:
-            print("No growth levers generated or found.")
-            
-        return updated_growth_levers
-    return []
+            pass # print(f"Growth Lever with ID {growth_lever_id_to_affect} not found for update in session.") # Removed print
+        return updated_levers_list
 
-# --- Test Function ---
-async def test_growth_levers_analyser():
-    print("Welcome to the Growth Levers Analyser Test!")
-    while True:
-        action = input("\nChoose action: (g)enerate new, (u)pdate singular, (d)elete singular, or (q)uit: ").lower()
-        
-        if action == 'q':
-            break
-        elif action == 'g':
-            user_prompt = input("Enter your prompt for growth lever generation: ")
-            # is_modification=False for initial generation
-            await process_growth_levers(user_prompt=user_prompt, is_modification=False) 
-        elif action == 'u':
-            current_levers = await fetch_from_supabase('growth_levers_store')
-            if not current_levers:
-                print("No growth levers found to update.")
-                continue
-            print("\nCurrent Growth Levers:")
-            for gl in current_levers:
-                print(f"  ID: {gl.get('id')}, Type: {gl.get('type')}")
-            
-            gl_id = input("Enter the ID of the growth lever to update: ")
-            update_prompt = input(f"Enter the new details/prompt for growth lever ID {gl_id}: ")
-            await process_growth_levers(user_prompt=update_prompt, growth_lever_id_to_affect=gl_id)
-        elif action == 'd':
-            current_levers = await fetch_from_supabase('growth_levers_store')
-            if not current_levers:
-                print("No growth levers found to delete.")
-                continue
-            print("\nCurrent Growth Levers:")
-            for gl in current_levers:
-                print(f"  ID: {gl.get('id')}, Type: {gl.get('type')}")
-            
-            gl_id = input("Enter the ID of the growth lever to delete: ")
-            confirm = input(f"Are you sure you want to delete growth lever with ID {gl_id}? (yes/no): ").lower()
-            if confirm == 'yes':
-                await process_growth_levers(user_prompt="delete", growth_lever_id_to_affect=gl_id)
-            else:
-                print("Deletion cancelled.")
-        else:
-            print("Invalid action. Please choose from the available options.")
+    elif action_type == "generate":
+        suggested_growth_levers_raw = await call_llm_for_growth_levers(
+            prompt_text=user_prompt,
+            api_key=API_KEY or "",
+            product_summary=product_summary,
+            customer_demographics_summary=customer_demographics_summary,
+            campaign_performance_summary=campaign_performance_summary, 
+            audience_types_summary=audience_types_summary,
+            current_growth_levers_for_llm=None # Generating new, no existing context from LLM's perspective
+        )
 
-# This block allows you to run the test function directly when the script is executed.
-if __name__ == "__main__":
-    import asyncio
+        if suggested_growth_levers_raw:
+            # Add newly generated levers to the list
+            for suggested_gl in suggested_growth_levers_raw:
+                if 'id' not in suggested_gl or not suggested_gl['id']:
+                    suggested_gl['id'] = str(uuid.uuid4()) # Ensure new ID for new items
+                updated_levers_list.append(suggested_gl)
+            # print("Generated new growth levers and added to session.") # Removed print
+        return updated_levers_list
     
-    if not API_KEY:
-        print("\nERROR: OPENAI_API_KEY environment variable is not set. Please set it in your .env file.")
-        exit(1) # Exit if API key is missing
+    # If action_type is not recognized or falls through, return current list
+    return updated_levers_list
 
-    asyncio.run(test_growth_levers_analyser())
+# Removed test_growth_levers_analyser and if __name__ == "__main__": block

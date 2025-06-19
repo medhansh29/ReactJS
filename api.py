@@ -13,7 +13,6 @@ import json
 from audience_analyser import process_audiences
 from growth_levers import process_growth_levers
 from campaign_generator import process_campaign_ideas
-# Renamed from flow_generator to journey_generator as per the latest changes
 from flow_generator import process_journeys 
 
 app = FastAPI(
@@ -38,50 +37,61 @@ app.add_middleware(
 # Audience models
 class AudienceGenerateRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt for generating new audience types.")
+    current_audiences: List[Dict[str, Any]] = Field(..., description="Current list of audiences in UI session memory.")
 
 class AudienceModifyRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt describing the modification (e.g., 'Change the rationale for Eco-conscious Urban Professionals').")
     audience_id: str = Field(..., description="ID of the audience to modify.")
+    current_audiences: List[Dict[str, Any]] = Field(..., description="Current list of audiences in UI session memory.")
 
 class AudienceDeleteRequest(BaseModel):
     audience_id: str = Field(..., description="ID of the audience to delete.")
+    current_audiences: List[Dict[str, Any]] = Field(..., description="Current list of audiences in UI session memory.")
 
 # Growth Lever models
 class GrowthLeverGenerateRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt for generating new growth levers.")
+    current_growth_levers: List[Dict[str, Any]] = Field(..., description="Current list of growth levers in UI session memory.")
 
 class GrowthLeverModifyRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt describing the modification (e.g., 'Update details for Discount Campaign').")
     growth_lever_id: str = Field(..., description="ID of the growth lever to modify.")
+    current_growth_levers: List[Dict[str, Any]] = Field(..., description="Current list of growth levers in UI session memory.")
 
 class GrowthLeverDeleteRequest(BaseModel):
     growth_lever_id: str = Field(..., description="ID of the growth lever to delete.")
+    current_growth_levers: List[Dict[str, Any]] = Field(..., description="Current list of growth levers in UI session memory.")
 
 # Campaign Idea models
-class CampaignIdeaCombination(BaseModel):
-    audience_id: str = Field(..., description="ID of the audience to combine with.")
-    growth_lever_id: str = Field(..., description="ID of the growth lever to combine with.")
-    product_id: str = Field(..., description="ID of the product to combine with.")
+class CampaignIdeaCombinationData(BaseModel):
+    audience_data: Dict[str, Any] = Field(..., description="Full data of the audience to combine with.")
+    growth_lever_data: Dict[str, Any] = Field(..., description="Full data of the growth lever to combine with.")
+    product_data: Dict[str, Any] = Field(..., description="Full data of the product to combine with.")
 
 class CampaignIdeaGenerateRequest(BaseModel):
-    selected_combinations: List[CampaignIdeaCombination] = Field(..., description="List of audience-growth lever-product combinations to generate campaigns for.")
+    selected_combinations_data: List[CampaignIdeaCombinationData] = Field(..., description="List of full data for audience-growth lever-product combinations to generate campaigns for.")
+    current_campaigns: List[Dict[str, Any]] = Field(..., description="Current list of campaigns in UI session memory.")
     user_prompt: str = ""
 
 class CampaignIdeaModifyRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt describing the modification (e.g., 'Make campaign XYZ more aggressive').")
     campaign_id: str = Field(..., description="ID of the campaign to modify.")
+    current_campaigns: List[Dict[str, Any]] = Field(..., description="Current list of campaigns in UI session memory.")
 
 class CampaignIdeaDeleteRequest(BaseModel):
     campaign_id: str = Field(..., description="ID of the campaign to delete.")
+    current_campaigns: List[Dict[str, Any]] = Field(..., description="Current list of campaigns in UI session memory.")
 
-# Journey models (formerly Flow)
+# Journey models
 class JourneyGenerateRequest(BaseModel):
-    campaign_id: str = Field(..., description="ID of the campaign to generate journeys for.")
+    selected_campaign_data: Dict[str, Any] = Field(..., description="Full data of the campaign to generate journeys for.")
     user_prompt: str = ""
 
 class JourneyModifyRequest(BaseModel):
     user_prompt: str = Field(..., description="Prompt describing the modification (e.g., 'Add a step to journey ABC').")
     journey_id: str = Field(..., description="ID of the journey to modify.")
+    selected_campaign_data: Dict[str, Any] = Field(..., description="Full data of the campaign linked to this journey.")
+
 
 class JourneyDeleteRequest(BaseModel):
     journey_id: str = Field(..., description="ID of the journey to delete.")
@@ -96,16 +106,19 @@ async def read_root():
     """
     return {"message": "Campaign Strategy API is running!"}
 
-# Removed the /strategy endpoint as campaign_strategy.json is no longer the central storage
-
+# Audience Endpoints
 @app.post("/audiences/generate")
 async def generate_audiences(request: AudienceGenerateRequest):
     """
     Generates new audience types based on a user prompt.
-    Returns the updated list of audience records from Supabase.
+    Returns the updated list of audience records for UI session memory.
     """
     try:
-        updated_audiences = await process_audiences(user_prompt=request.user_prompt, is_modification=False)
+        updated_audiences = await process_audiences(
+            user_prompt=request.user_prompt,
+            current_audiences=request.current_audiences,
+            action_type="generate"
+        )
         return {"message": "Audiences generated successfully", "data": updated_audiences}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate audiences: {e}")
@@ -113,41 +126,50 @@ async def generate_audiences(request: AudienceGenerateRequest):
 @app.put("/audiences/modify")
 async def modify_audience(request: AudienceModifyRequest):
     """
-    Modifies a specific audience type by ID.
-    Returns the updated list of audience records from Supabase.
+    Modifies a specific audience type by ID in UI session memory.
+    Returns the updated list of audience records for UI session memory.
     """
     try:
         updated_audiences = await process_audiences(
             user_prompt=request.user_prompt,
+            current_audiences=request.current_audiences,
+            action_type="update_singular",
             audience_id_to_affect=request.audience_id
         )
         return {"message": f"Audience {request.audience_id} modified successfully", "data": updated_audiences}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to modify audience: {e}")
 
-@app.delete("/audiences/delete/{audience_id}")
-async def delete_audience(audience_id: str):
+@app.delete("/audiences/delete")
+async def delete_audience(request: AudienceDeleteRequest):
     """
-    Deletes a specific audience type by ID.
-    Returns the updated list of audience records from Supabase.
+    Deletes a specific audience type by ID from UI session memory.
+    Returns the updated list of audience records for UI session memory.
     """
     try:
         updated_audiences = await process_audiences(
-            user_prompt="delete", # Signal delete action to the function
-            audience_id_to_affect=audience_id
+            user_prompt="", # Not used for delete action type
+            current_audiences=request.current_audiences,
+            action_type="delete_singular",
+            audience_id_to_affect=request.audience_id
         )
-        return {"message": f"Audience {audience_id} deleted successfully", "data": updated_audiences}
+        return {"message": f"Audience {request.audience_id} deleted successfully", "data": updated_audiences}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete audience: {e}")
 
+# Growth Lever Endpoints
 @app.post("/growth-levers/generate")
 async def generate_growth_levers(request: GrowthLeverGenerateRequest):
     """
-    Generates new growth levers based on a user prompt.
-    Returns the updated list of growth lever records from Supabase.
+    Generates new growth levers based on a user prompt for UI session memory.
+    Returns the updated list of growth lever records for UI session memory.
     """
     try:
-        updated_levers = await process_growth_levers(user_prompt=request.user_prompt, is_modification=False)
+        updated_levers = await process_growth_levers(
+            user_prompt=request.user_prompt,
+            current_growth_levers=request.current_growth_levers,
+            action_type="generate"
+        )
         return {"message": "Growth levers generated successfully", "data": updated_levers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate growth levers: {e}")
@@ -155,43 +177,49 @@ async def generate_growth_levers(request: GrowthLeverGenerateRequest):
 @app.put("/growth-levers/modify")
 async def modify_growth_lever(request: GrowthLeverModifyRequest):
     """
-    Modifies a specific growth lever by ID.
-    Returns the updated list of growth lever records from Supabase.
+    Modifies a specific growth lever by ID in UI session memory.
+    Returns the updated list of growth lever records for UI session memory.
     """
     try:
         updated_levers = await process_growth_levers(
             user_prompt=request.user_prompt,
+            current_growth_levers=request.current_growth_levers,
+            action_type="update_singular",
             growth_lever_id_to_affect=request.growth_lever_id
         )
         return {"message": f"Growth lever {request.growth_lever_id} modified successfully", "data": updated_levers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to modify growth lever: {e}")
 
-@app.delete("/growth-levers/delete/{growth_lever_id}")
-async def delete_growth_lever(growth_lever_id: str):
+@app.delete("/growth-levers/delete")
+async def delete_growth_lever(request: GrowthLeverDeleteRequest):
     """
-    Deletes a specific growth lever by ID.
-    Returns the updated list of growth lever records from Supabase.
+    Deletes a specific growth lever by ID from UI session memory.
+    Returns the updated list of growth lever records for UI session memory.
     """
     try:
         updated_levers = await process_growth_levers(
-            user_prompt="delete", # Signal delete action to the function
-            growth_lever_id_to_affect=growth_lever_id
+            user_prompt="", # Not used for delete action type
+            current_growth_levers=request.current_growth_levers,
+            action_type="delete_singular",
+            growth_lever_id_to_affect=request.growth_lever_id
         )
-        return {"message": f"Growth lever {growth_lever_id} deleted successfully", "data": updated_levers}
+        return {"message": f"Growth lever {request.growth_lever_id} deleted successfully", "data": updated_levers}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete growth lever: {e}")
 
+# Campaign Idea Endpoints
 @app.post("/campaign-ideas/generate")
 async def generate_campaign_ideas(request: CampaignIdeaGenerateRequest):
     """
-    Generates new campaign ideas based on selected audience, growth lever, and product combinations.
-    Returns the updated list of campaign records from Supabase.
+    Generates new campaign ideas based on selected audience, growth lever, and product combinations for UI session memory.
+    Returns the updated list of campaign records for UI session memory.
     """
     try:
         updated_campaigns = await process_campaign_ideas(
             user_prompt=request.user_prompt,
-            selected_combinations=[comb.dict() for comb in request.selected_combinations],
+            current_campaigns=request.current_campaigns,
+            selected_combinations_data=[comb.dict() for comb in request.selected_combinations_data],
             action_type="generate"
         )
         return {"message": "Campaign ideas generated successfully", "data": updated_campaigns}
@@ -201,62 +229,66 @@ async def generate_campaign_ideas(request: CampaignIdeaGenerateRequest):
 @app.put("/campaign-ideas/modify")
 async def modify_campaign_idea(request: CampaignIdeaModifyRequest):
     """
-    Modifies a specific campaign idea by ID.
-    Returns the updated list of campaign records from Supabase.
+    Modifies a specific campaign idea by ID in UI session memory.
+    Returns the updated list of campaign records for UI session memory.
     """
     try:
         updated_campaigns = await process_campaign_ideas(
             user_prompt=request.user_prompt,
-            campaign_id_to_affect=request.campaign_id,
-            action_type="update_singular"
+            current_campaigns=request.current_campaigns,
+            action_type="update_singular",
+            campaign_id_to_affect=request.campaign_id
         )
         return {"message": f"Campaign idea {request.campaign_id} modified successfully", "data": updated_campaigns}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to modify campaign idea: {e}")
 
-@app.delete("/campaign-ideas/delete/{campaign_id}")
-async def delete_campaign_idea(campaign_id: str):
+@app.delete("/campaign-ideas/delete")
+async def delete_campaign_idea(request: CampaignIdeaDeleteRequest):
     """
-    Deletes a specific campaign idea by ID.
-    Returns the updated list of campaign records from Supabase.
+    Deletes a specific campaign idea by ID from UI session memory.
+    Returns the updated list of campaign records for UI session memory.
     """
     try:
         updated_campaigns = await process_campaign_ideas(
-            campaign_id_to_affect=campaign_id,
-            action_type="delete_singular"
+            user_prompt="", # Not used for delete action type
+            current_campaigns=request.current_campaigns,
+            action_type="delete_singular",
+            campaign_id_to_affect=request.campaign_id
         )
-        return {"message": f"Campaign idea {campaign_id} deleted successfully", "data": updated_campaigns}
+        return {"message": f"Campaign idea {request.campaign_id} deleted successfully", "data": updated_campaigns}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete campaign idea: {e}")
 
-
+# Journey Endpoints (still persist to Supabase)
 @app.post("/journeys/generate")
 async def generate_journeys(request: JourneyGenerateRequest):
     """
-    Generates new marketing journeys for a given campaign.
+    Generates new marketing journeys for a given campaign and saves to Supabase.
     Returns the updated list of journey records from Supabase.
     """
     try:
         updated_journeys = await process_journeys(
             user_prompt=request.user_prompt,
-            campaign_id_for_generation=request.campaign_id,
+            selected_campaign_data=request.selected_campaign_data,
             action_type="generate"
         )
-        return {"message": "Journeys generated successfully", "data": updated_journeys}
+        return {"message": "Journeys generated and saved successfully", "data": updated_journeys}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate journeys: {e}")
 
 @app.put("/journeys/modify")
 async def modify_journey(request: JourneyModifyRequest):
     """
-    Modifies a specific marketing journey by ID.
+    Modifies a specific marketing journey by ID and updates in Supabase.
     Returns the updated list of journey records from Supabase.
     """
     try:
         updated_journeys = await process_journeys(
             user_prompt=request.user_prompt,
-            journey_id_to_affect=request.journey_id,
-            action_type="update_singular"
+            selected_campaign_data=request.selected_campaign_data,
+            action_type="update_singular",
+            journey_id_to_affect=request.journey_id
         )
         return {"message": f"Journey {request.journey_id} modified successfully", "data": updated_journeys}
     except Exception as e:
@@ -265,17 +297,18 @@ async def modify_journey(request: JourneyModifyRequest):
 @app.delete("/journeys/delete/{journey_id}")
 async def delete_journey(journey_id: str):
     """
-    Deletes a specific marketing journey by ID.
+    Deletes a specific marketing journey by ID from Supabase.
     Returns the updated list of journey records from Supabase.
     """
     try:
         updated_journeys = await process_journeys(
-            journey_id_to_affect=journey_id,
-            action_type="delete_singular"
+            user_prompt="", # Not used for delete action type
+            selected_campaign_data={}, # Placeholder, as it's not strictly needed for delete journey from DB
+            action_type="delete_singular",
+            journey_id_to_affect=journey_id
         )
         return {"message": f"Journey {journey_id} deleted successfully", "data": updated_journeys}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete journey: {e}")
 
 # The if __name__ == "__main__": block is removed for production deployment with Gunicorn
-# uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)

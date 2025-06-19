@@ -24,13 +24,13 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable must be set.")
 
-# Initialize Supabase client
+# Initialize Supabase client (only used for read-only contextual data)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # --- Pydantic Models for Structured Output ---
 
 class CampaignIdea(BaseModel):
-    """Represents a generated campaign idea, matching the 'campaigns' Supabase table schema."""
+    """Represents a generated campaign idea, matching the 'campaigns' table schema (for UI memory)."""
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique ID for the campaign idea.")
     name: str = Field(description="A descriptive name for the campaign idea.")
     description: str = Field(description="Specific details and actions for this campaign.")
@@ -42,75 +42,46 @@ class CampaignIdea(BaseModel):
         default=None,
         description="The exact discount percentage for this campaign (e.g., 10.5 for 10.5%). Null if not applicable."
     )
-    audience_id: str = Field(description="The ID of the target audience used for this campaign (from audience_store).")
-    growth_lever_id: str = Field(description="The ID of the growth lever used for this campaign (from growth_levers_store).")
-    product_id: str = Field(description="The ID of the product targeted by this campaign (from product_store).")
+    audience_id: str = Field(description="The ID of the target audience used for this campaign.")
+    growth_lever_id: str = Field(description="The ID of the growth lever used for this campaign.")
+    product_id: str = Field(description="The ID of the product targeted by this campaign.")
 
 
 class CampaignIdeas(BaseModel):
     """A list of generated campaign ideas."""
-    campaign_ideas: List[CampaignIdea] = Field(description="A list of 2-3 distinct campaign ideas.")
+    campaign_ideas: List[CampaignIdea] = Field(description="A list of 1-2 distinct campaign ideas.")
 
-# --- Supabase Helper Functions ---
+# --- Supabase Helper Functions (Only fetch for contextual read-only data) ---
 
 async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Fetches data from a specified Supabase table, optionally by ID."""
+    """
+    Fetches data from a specified Supabase table, optionally by ID.
+    This function is retained only for fetching *read-only* contextual data.
+    """
     try:
         query = supabase.from_(table_name).select('*')
         if id:
             query = query.eq('id', id)
         response = query.execute()
         if response and hasattr(response, 'data'):
-            print(f"Successfully fetched data from {table_name}. Number of records: {len(response.data)}")
             return response.data
-        print(f"Warning: No data found in {table_name}.")
         return []
     except Exception as e:
-        print(f"Error fetching data from Supabase table {table_name}: {e}")
         return []
 
-async def insert_into_campaigns_store(data: List[Dict]) -> None:
-    """Inserts data into the 'campaigns' Supabase table."""
-    try:
-        response = supabase.from_('campaigns').insert(data).execute()
-        if response and hasattr(response, 'data'):
-            print(f"Successfully inserted {len(response.data)} records into campaigns table.")
-        else:
-            print(f"No data returned on insert to campaigns, but request sent.")
-    except Exception as e:
-        print(f"Error inserting data into campaigns table: {e}")
-
-async def update_campaigns_store(id: str, data: Dict) -> None:
-    """Updates a record in the 'campaigns' Supabase table."""
-    try:
-        response = supabase.from_('campaigns').update(data).eq('id', id).execute()
-        if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully updated record {id} in campaigns table.")
-        else:
-            print(f"No data returned on update for id {id}, but request sent or no matching id found.")
-    except Exception as e:
-        print(f"Error updating record {id} in campaigns table: {e}")
-
-async def delete_from_supabase(table_name: str, id: str) -> None:
-    """Deletes a record from a specified Supabase table by ID."""
-    try:
-        response = supabase.from_(table_name).delete().eq('id', id).execute()
-        if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully deleted record {id} from {table_name}.")
-        else:
-            print(f"No data returned on delete for id {id} from {table_name}, but request sent or no matching id found.")
-    except Exception as e:
-        print(f"Error deleting record {id} from {table_name}: {e}")
+# Removed insert_into_campaigns_store
+# Removed update_campaigns_store
+# Removed delete_from_supabase (as it was only used for campaigns in this file)
 
 # --- LLM Call Function ---
 
 async def call_llm_for_campaign_ideas(
     api_key: str,
+    selected_audience_data: Dict[str, Any], # Now mandatory, passed from UI memory
+    selected_growth_lever_data: Dict[str, Any], # Now mandatory, passed from UI memory
+    selected_product_data: Dict[str, Any], # Now mandatory, passed from UI memory
     user_prompt: str = "",
-    selected_audience_data: Optional[Dict[str, Any]] = None,
-    selected_growth_lever_data: Optional[Dict[str, Any]] = None,
-    selected_product_data: Optional[Dict[str, Any]] = None,
-    current_campaign_ideas_for_llm: Optional[List[Dict[str, Any]]] = None # For modification mode
+    current_campaign_ideas_for_llm: Optional[List[Dict[str, Any]]] = None # Current state from UI memory
 ) -> List[Dict[str, Any]]:
     """Calls the OpenAI LLM to generate or modify campaign ideas with minimal, relevant data."""
     llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key) if api_key else None)
@@ -137,13 +108,18 @@ async def call_llm_for_campaign_ideas(
         
         {format_instructions_var}
         """
-        template_variables["current_campaign_ideas_json"] = json.dumps(current_campaign_ideas_for_llm, indent=2)
+        # Ensure 'id' is included when passing current campaigns to LLM for modification
+        campaigns_with_id_for_llm = [
+            {k: v for k, v in camp.items()} # Copy all items including 'id'
+            for camp in current_campaign_ideas_for_llm
+        ]
+        template_variables["current_campaign_ideas_json"] = json.dumps(campaigns_with_id_for_llm, indent=2)
     else: # Generation mode
-        # These fields are guaranteed to be present if selected_audience_data etc. are not None
-        audience_title = selected_audience_data.get('title', 'N/A') if selected_audience_data else 'N/A'
-        growth_lever_type = selected_growth_lever_data.get('type', 'N/A') if selected_growth_lever_data else 'N/A'
-        product_name = selected_product_data.get('name', 'N/A') if selected_product_data else 'N/A'
-        discount_percentage = selected_growth_lever_data.get('exact_discount_percentage') if selected_growth_lever_data else None
+        # These fields are guaranteed to be present as they are passed from UI's memory
+        audience_title = selected_audience_data.get('title', 'N/A')
+        growth_lever_type = selected_growth_lever_data.get('type', 'N/A')
+        product_name = selected_product_data.get('name', 'N/A')
+        discount_percentage = selected_growth_lever_data.get('exact_discount_percentage')
 
         full_prompt_template_str = """
         Based on the following *specifically selected* audience, growth lever, and product details, generate 1-2 compelling campaign ideas.
@@ -188,19 +164,19 @@ async def call_llm_for_campaign_ideas(
         template_variables.update(
             **{
                 "audience_title": audience_title,
-                "audience_rationale": selected_audience_data.get('rationale') if selected_audience_data else None,
-                "audience_size": selected_audience_data.get('audience_size') if selected_audience_data else None,
-                "audience_id": selected_audience_data.get('id') if selected_audience_data else None,
+                "audience_rationale": selected_audience_data.get('rationale'),
+                "audience_size": selected_audience_data.get('audience_size'),
+                "audience_id": selected_audience_data.get('id'),
 
                 "growth_lever_type": growth_lever_type,
-                "growth_lever_details": selected_growth_lever_data.get('details') if selected_growth_lever_data else None,
-                "growth_lever_rationale": selected_growth_lever_data.get('rationale') if selected_growth_lever_data else None,
-                "growth_lever_id": selected_growth_lever_data.get('id') if selected_growth_lever_data else None,
-                "discount_percentage": discount_percentage, # Already handled for None
+                "growth_lever_details": selected_growth_lever_data.get('details'),
+                "growth_lever_rationale": selected_growth_lever_data.get('rationale'),
+                "growth_lever_id": selected_growth_lever_data.get('id'),
+                "discount_percentage": discount_percentage,
 
                 "product_name": product_name,
-                "product_id": selected_product_data.get('id') if selected_product_data else None,
-                "product_description": selected_product_data.get('description') if selected_product_data else None,
+                "product_id": selected_product_data.get('id'),
+                "product_description": selected_product_data.get('description'),
             }
         )
 
@@ -210,268 +186,110 @@ async def call_llm_for_campaign_ideas(
         response = await chain.ainvoke(template_variables)
         return [idea.model_dump() for idea in response.campaign_ideas]
     except ValidationError as e:
-        print(f"Validation Error during LLM campaign idea call: {e.errors()}")
-        print(f"LLM probably did not return the expected JSON format. Raw error: {e}")
+        # Removed print statement for production readiness
         return []
     except Exception as e:
-        print(f"Error during LLM campaign idea call: {e}")
+        # Removed print statement for production readiness
         return []
 
 async def process_campaign_ideas(
-    user_prompt: str = "", # For initial generation prompt or modification prompt
-    selected_combinations: Optional[List[Dict[str, str]]] = None, # For generation: [{'audience_id': 'uuid', 'growth_lever_id': 'uuid', 'product_id': 'uuid'}]
-    campaign_id_to_affect: Optional[str] = None, # For singular update/delete
-    action_type: str = "generate" # 'generate', 'update_singular', 'delete_singular'
+    current_campaigns: List[Dict[str, Any]], # Now passed from UI's session memory
+    user_prompt: str = "",
+    action_type: str = "generate", # 'generate', 'update_singular', 'delete_singular'
+    # For generation: combo of full data, not just IDs
+    selected_combinations_data: Optional[List[Dict[str, Any]]] = None, 
+    campaign_id_to_affect: Optional[str] = None # For singular update/delete
 ) -> List[Dict[str, Any]]:
     """
-    Generates, updates, or deletes campaign ideas and updates the 'campaigns' Supabase table.
-    Returns the updated list of campaign records from Supabase.
+    Generates, updates, or deletes campaign ideas in memory.
+    Returns the updated list of campaign records for UI session memory.
     """
-    # Fetch only the campaigns directly relevant to the current operation, if any
-    current_campaigns_from_db = await fetch_from_supabase('campaigns')
+    updated_campaigns_list = list(current_campaigns) # Create a mutable copy
 
     if action_type == "delete_singular":
         if campaign_id_to_affect:
-            await delete_from_supabase('campaigns', campaign_id_to_affect)
-        return await fetch_from_supabase('campaigns')
+            updated_campaigns_list = [c for c in updated_campaigns_list if c.get('id') != campaign_id_to_affect]
+        return updated_campaigns_list
 
     elif action_type == "update_singular":
         if not campaign_id_to_affect:
-            print("No campaign ID provided for singular update.")
-            return await fetch_from_supabase('campaigns')
+            return updated_campaigns_list
 
-        campaign_to_update = next((c for c in current_campaigns_from_db if c.get('id') == campaign_id_to_affect), None)
+        campaign_to_update = next((c for c in updated_campaigns_list if c.get('id') == campaign_id_to_affect), None)
         if not campaign_to_update:
-            print(f"Campaign with ID {campaign_id_to_affect} not found for update.")
-            return await fetch_from_supabase('campaigns')
+            return updated_campaigns_list # Campaign not found in current memory
 
-        # Fetch only the specific linked audience, lever, and product for the campaign being updated
+        # To update a singular campaign, we need to provide its current context to the LLM.
+        # This means extracting the linked audience, growth lever, and product data from the UI's session.
+        # This requires the UI to pass these full objects or for these functions to fetch from read-only sources.
+        # For this refactor, we assume the UI provides enough context or the `fetch_from_supabase` is sufficient
+        # for these *read-only* lookups.
+
+        # Fetch full details of the linked entities from their respective tables (read-only context)
+        # Note: These are fetches for context for the LLM, not for saving/updating these tables.
         selected_audience = (await fetch_from_supabase('audience_store', campaign_to_update.get('audience_id')))[0] if campaign_to_update.get('audience_id') else None
         selected_growth_lever = (await fetch_from_supabase('growth_levers_store', campaign_to_update.get('growth_lever_id')))[0] if campaign_to_update.get('growth_lever_id') else None
         selected_product = (await fetch_from_supabase('product_store', campaign_to_update.get('product_id')))[0] if campaign_to_update.get('product_id') else None
 
         if not all([selected_audience, selected_growth_lever, selected_product]):
-            print(f"ERROR: Linked audience, growth lever, or product data missing for campaign ID {campaign_id_to_affect}.")
-            return await fetch_from_supabase('campaigns')
+            # print(f"ERROR: Linked audience, growth lever, or product data missing for campaign ID {campaign_id_to_affect}. Cannot update.") # Removed print
+            return updated_campaigns_list
 
-        # Pass the existing campaign idea to the LLM for modification
+        if not all([selected_audience, selected_growth_lever, selected_product]):
+            return updated_campaigns_list
+
         llm_response_list = await call_llm_for_campaign_ideas(
             api_key=API_KEY or "",
-            user_prompt=user_prompt, # User's specific modification request
-            selected_audience_data=selected_audience, # Provide context of linked entities
-            selected_growth_lever_data=selected_growth_lever,
-            selected_product_data=selected_product,
+            user_prompt=user_prompt,
+            selected_audience_data=selected_audience if selected_audience is not None else {},
+            selected_growth_lever_data=selected_growth_lever if selected_growth_lever is not None else {},
+            selected_product_data=selected_product if selected_product is not None else {},
             current_campaign_ideas_for_llm=[campaign_to_update] # Send the specific campaign to modify
         )
 
         if llm_response_list:
-            updated_campaign_data = llm_response_list[0] # Expecting only one updated campaign
-            
-            # Preserve the original ID for the update operation
-            updated_campaign_data['id'] = campaign_id_to_affect 
-            
-            # Ensure consistency with DB schema and chosen IDs
-            data_to_update = {
-                "id": updated_campaign_data.get('id'),
-                "name": updated_campaign_data.get('name'),
-                "description": updated_campaign_data.get('description'),
-                "hypothesis": updated_campaign_data.get('hypothesis'),
-                "target_cohort": updated_campaign_data.get('target_cohort'),
-                "lever_config": updated_campaign_data.get('lever_config'),
-                "product": updated_campaign_data.get('product'),
-                "discount_percentage": updated_campaign_data.get('discount_percentage'),
-                "audience_id": updated_campaign_data.get('audience_id'), # Ensure these are correct from LLM
-                "growth_lever_id": updated_campaign_data.get('growth_lever_id'),
-                "product_id": updated_campaign_data.get('product_id'),
-            }
-            await update_campaigns_store(campaign_id_to_affect, data_to_update)
-            print(f"\n--- Updated Single Campaign (ID: {campaign_id_to_affect}) ---")
-            print(f"Name: {data_to_update.get('name')}")
-            print(f"Description: {data_to_update.get('description')}")
-            print(f"Target Audience: {data_to_update.get('target_cohort')} (ID: {data_to_update.get('audience_id')})")
-            print(f"Growth Lever: {data_to_update.get('lever_config')} (ID: {data_to_update.get('growth_lever_id')})")
-            print(f"Product: {data_to_update.get('product')} (ID: {data_to_update.get('product_id')})")
-            print(f"Discount: {data_to_update.get('discount_percentage')}")
-            print("-" * 30)
-            return await fetch_from_supabase('campaigns')
-        else:
-            print(f"Could not generate update for campaign ID {campaign_id_to_affect}.")
-        return await fetch_from_supabase('campaigns')
+            updated_campaign_data = llm_response_list[0]
+            # Find and replace the updated campaign in the list
+            for i, camp in enumerate(updated_campaigns_list):
+                if camp.get('id') == campaign_id_to_affect:
+                    updated_campaign_data['id'] = campaign_id_to_affect # Preserve ID
+                    updated_campaigns_list[i] = updated_campaign_data
+                    break
+        return updated_campaigns_list
 
     elif action_type == "generate":
-        if not selected_combinations:
-            print("No combinations selected for campaign generation.")
-            return await fetch_from_supabase('campaigns')
+        if not selected_combinations_data:
+            return updated_campaigns_list
 
-        generated_campaigns_to_insert = []
-        for combo in selected_combinations:
-            aud_id = combo['audience_id']
-            gl_id = combo['growth_lever_id']
-            prod_id = combo['product_id']
-
-            # Fetch specific data for the current combination only
-            selected_audience = (await fetch_from_supabase('audience_store', aud_id))[0] if aud_id else None
-            selected_growth_lever = (await fetch_from_supabase('growth_levers_store', gl_id))[0] if gl_id else None
-            selected_product = (await fetch_from_supabase('product_store', prod_id))[0] if prod_id else None
+        for combo_data in selected_combinations_data:
+            selected_audience = combo_data.get('audience_data')
+            selected_growth_lever = combo_data.get('growth_lever_data')
+            selected_product = combo_data.get('product_data')
 
             if not all([selected_audience, selected_growth_lever, selected_product]):
-                print(f"Warning: Skipping combination due to missing data: Audience ID {aud_id}, GL ID {gl_id}, Product ID {prod_id}.")
+                # print(f"Warning: Skipping combination due to incomplete data.") # Removed print
                 continue
 
             generated_ideas = await call_llm_for_campaign_ideas(
                 api_key=API_KEY or "",
                 user_prompt=user_prompt,
-                selected_audience_data=selected_audience,
-                selected_growth_lever_data=selected_growth_lever,
-                selected_product_data=selected_product,
-                current_campaign_ideas_for_llm=None # Not modifying existing, generating new
+                selected_audience_data=selected_audience if selected_audience is not None else {},
+                selected_growth_lever_data=selected_growth_lever if selected_growth_lever is not None else {},
+                selected_product_data=selected_product if selected_product is not None else {},
+                current_campaign_ideas_for_llm=None
             )
             
             if generated_ideas:
                 for idea in generated_ideas:
-                    # Populate the IDs from the selected combination
-                    idea['audience_id'] = aud_id
-                    idea['growth_lever_id'] = gl_id
-                    idea['product_id'] = prod_id
-                    # The 'id' for a new campaign is generated by the Pydantic model's default_factory
-                    generated_campaigns_to_insert.append(idea)
-        
-        if generated_campaigns_to_insert:
-            await insert_into_campaigns_store(generated_campaigns_to_insert)
-
-        updated_campaigns = await fetch_from_supabase('campaigns')
-        
-        print("\n--- Generated Campaigns ---")
-        if updated_campaigns:
-            for camp in updated_campaigns:
-                print(f"ID: {camp.get('id')}")
-                print(f"Name: {camp.get('name')}")
-                print(f"Description: {camp.get('description')}")
-                print(f"Hypothesis: {camp.get('hypothesis')}")
-                print(f"Target Audience: {camp.get('target_cohort')} (ID: {camp.get('audience_id')})")
-                print(f"Growth Lever: {camp.get('lever_config')} (ID: {camp.get('growth_lever_id')})")
-                print(f"Product: {camp.get('product')} (ID: {camp.get('product_id')})")
-                print(f"Discount: {camp.get('discount_percentage')}")
-                print("-" * 30)
-        else:
-            print("No campaigns generated or found.")
-            
-        return updated_campaigns
+                    if 'id' not in idea or not idea['id']:
+                        idea['id'] = str(uuid.uuid4())
+                    # Ensure IDs from the *selected combo* are correctly linked
+                    idea['audience_id'] = selected_audience.get('id') if selected_audience else None
+                    idea['growth_lever_id'] = selected_growth_lever.get('id') if selected_growth_lever else None
+                    idea['product_id'] = selected_product.get('id') if selected_product else None
+                    updated_campaigns_list.append(idea)
+        return updated_campaigns_list
     
-    return await fetch_from_supabase('campaigns')
+    return updated_campaigns_list # Default return
 
-
-# --- Test Function ---
-async def test_campaign_generator():
-    print("Welcome to the Campaign Generator Test!")
-    while True:
-        action = input("\nChoose action: (g)enerate new, (u)pdate singular, (d)elete singular, or (q)uit: ").lower()
-        
-        if action == 'q':
-            break
-        elif action == 'g':
-            audiences = await fetch_from_supabase('audience_store')
-            growth_levers = await fetch_from_supabase('growth_levers_store')
-            products = await fetch_from_supabase('product_store')
-
-            if not audiences:
-                print("No audiences found. Please generate audiences first using audience_analyser.py.")
-                continue
-            if not growth_levers:
-                print("No growth levers found. Please generate growth levers first using growth_levers.py.")
-                continue
-            if not products:
-                print("No products found in product_store.")
-                continue
-
-            print("\nAvailable Audiences:")
-            for i, aud in enumerate(audiences):
-                print(f"   {i+1}. ID: {aud.get('id')}, Title: {aud.get('title')}, Size: {aud.get('audience_size')}")
-
-            print("\nAvailable Growth Levers:")
-            for i, gl in enumerate(growth_levers):
-                print(f"   {i+1}. ID: {gl.get('id')}, Type: {gl.get('type')}")
-            
-            print("\nAvailable Products:")
-            for i, prod in enumerate(products):
-                print(f"   {i+1}. ID: {prod.get('id')}, Name: {prod.get('name')}") # Assuming 'name' column for product
-
-            selected_combinations = []
-            while True:
-                aud_choice = input("Enter audience number (or 'done' to finish choosing audiences): ")
-                if aud_choice.lower() == 'done':
-                    break
-                try:
-                    aud_index = int(aud_choice) - 1
-                    if 0 <= aud_index < len(audiences):
-                        chosen_aud_id = audiences[aud_index]['id']
-                        
-                        gl_choice = input("Enter growth lever number for this audience: ")
-                        prod_choice = input("Enter product number for this combination: ")
-
-                        try:
-                            gl_index = int(gl_choice) - 1
-                            prod_index = int(prod_choice) - 1
-                            if 0 <= gl_index < len(growth_levers) and 0 <= prod_index < len(products):
-                                chosen_gl_id = growth_levers[gl_index]['id']
-                                chosen_prod_id = products[prod_index]['id']
-                                selected_combinations.append({
-                                    'audience_id': chosen_aud_id,
-                                    'growth_lever_id': chosen_gl_id,
-                                    'product_id': chosen_prod_id
-                                })
-                                print(f"Selected: Audience '{audiences[aud_index]['title']}', Growth Lever '{growth_levers[gl_index]['type']}', Product '{products[prod_index]['name']}'")
-                            else:
-                                print("Invalid growth lever or product number. Please try again.")
-                        except ValueError:
-                            print("Invalid input. Please enter numbers for growth lever and product.")
-                    else:
-                        print("Invalid audience number. Please try again.")
-                except ValueError:
-                    print("Invalid input. Please enter a number for audience or 'done'.")
-            
-            if not selected_combinations:
-                print("No valid combinations selected. Returning.")
-                continue
-
-            user_prompt = input("Enter an optional prompt for campaign generation (e.g., 'Make it humorous'): ")
-            await process_campaign_ideas(user_prompt=user_prompt, selected_combinations=selected_combinations, action_type="generate")
-        
-        elif action == 'u':
-            current_campaigns = await fetch_from_supabase('campaigns')
-            if not current_campaigns:
-                print("No campaigns found to update.")
-                continue
-            print("\nCurrent Campaigns:")
-            for camp in current_campaigns:
-                print(f"   ID: {camp.get('id')}, Name: {camp.get('name')}")
-            
-            camp_id = input("Enter the ID of the campaign to update: ")
-            update_prompt = input(f"Enter the new details/prompt for campaign ID {camp_id}: ")
-            await process_campaign_ideas(user_prompt=update_prompt, campaign_id_to_affect=camp_id, action_type="update_singular")
-        
-        elif action == 'd':
-            current_campaigns = await fetch_from_supabase('campaigns')
-            if not current_campaigns:
-                print("No campaigns found to delete.")
-                continue
-            print("\nCurrent Campaigns:")
-            for camp in current_campaigns:
-                print(f"   ID: {camp.get('id')}, Name: {camp.get('name')}")
-            
-            camp_id = input("Enter the ID of the campaign to delete: ")
-            confirm = input(f"Are you sure you want to delete campaign with ID {camp_id}? (yes/no): ").lower()
-            if confirm == 'yes':
-                await process_campaign_ideas(campaign_id_to_affect=camp_id, action_type="delete_singular")
-            else:
-                print("Deletion cancelled.")
-        else:
-            print("Invalid action. Please choose from the available options.")
-
-# This block allows you to run the test function directly when the script is executed.
-if __name__ == "__main__":
-    if not API_KEY:
-        print("\nERROR: OPENAI_API_KEY environment variable is not set. Please set it in your .env file.")
-        exit(1) # Exit if API key is missing
-
-    asyncio.run(test_campaign_generator())
+# Removed test_campaign_generator and if __name__ == "__main__": block

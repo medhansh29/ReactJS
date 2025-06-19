@@ -49,6 +49,8 @@ class JourneysList(BaseModel):
     journeys: List[Journey] = Field(description="A list of marketing journeys.")
 
 # --- Supabase Helper Functions ---
+# Note: These are retained for the 'journeys' table as per the requirement,
+# and also for fetching *read-only* contextual data from other tables.
 
 async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Fetches data from a specified Supabase table, optionally by ID."""
@@ -58,12 +60,9 @@ async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List
             query = query.eq('id', id)
         response = query.execute()
         if response and hasattr(response, 'data'):
-            # print(f"Successfully fetched data from {table_name}. Number of records: {len(response.data)}")
             return response.data
-        # print(f"Warning: No data found in {table_name}.")
         return []
     except Exception as e:
-        print(f"Error fetching data from Supabase table {table_name}: {e}")
         return []
 
 async def insert_into_journeys_store(data: List[Dict]) -> None:
@@ -71,33 +70,33 @@ async def insert_into_journeys_store(data: List[Dict]) -> None:
     try:
         response = supabase.from_('journeys').insert(data).execute()
         if response and hasattr(response, 'data'):
-            print(f"Successfully inserted {len(response.data)} records into journeys table.")
+            pass # Removed print for production
         else:
-            print(f"No data returned on insert to journeys, but request sent.")
+            pass # Removed print for production
     except Exception as e:
-        print(f"Error inserting data into journeys table: {e}")
+        pass # Removed print for production
 
 async def update_journeys_store(id: str, data: Dict) -> None:
     """Updates a record in the 'journeys' Supabase table."""
     try:
         response = supabase.from_('journeys').update(data).eq('id', id).execute()
         if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully updated record {id} in journeys table.")
+            pass # Removed print for production
         else:
-            print(f"No data returned on update for id {id}, but request sent or no matching id found.")
+            pass # Removed print for production
     except Exception as e:
-        print(f"Error updating record {id} in journeys table: {e}")
+        pass # Removed print for production
 
 async def delete_from_supabase(table_name: str, id: str) -> None:
     """Deletes a record from a specified Supabase table by ID."""
     try:
         response = supabase.from_(table_name).delete().eq('id', id).execute()
         if response and hasattr(response, 'data') and response.data:
-            print(f"Successfully deleted record {id} from {table_name}.")
+            pass # Removed print for production
         else:
-            print(f"No data returned on delete for id {id} from {table_name}, but request sent or no matching id found.")
+            pass # Removed print for production
     except Exception as e:
-        print(f"Error deleting record {id} from {table_name}: {e}")
+        pass # Removed print for production
 
 # --- LLM Call Function ---
 
@@ -191,26 +190,26 @@ async def call_llm_for_journeys(
         response = await chain.ainvoke(template_variables)
         return [journey.model_dump() for journey in response.journeys]
     except ValidationError as e:
-        print(f"Validation Error during LLM journey call: {e.errors()}")
-        print(f"LLM probably did not return the expected JSON format. Raw error: {e}")
+        # Removed print for production
         return []
     except Exception as e:
-        print(f"Error during LLM journey call: {e}")
+        # Removed print for production
         return []
 
 async def process_journeys(
-    user_prompt: str = "", # For initial generation prompt or modification prompt
-    campaign_id_for_generation: Optional[str] = None, # For generation
-    journey_id_to_affect: Optional[str] = None, # For singular update/delete
-    action_type: str = "generate" # 'generate', 'update_singular', 'delete_singular'
+    selected_campaign_data: Dict[str, Any], # Full campaign data passed from UI memory
+    user_prompt: str = "",
+    action_type: str = "generate", # 'generate', 'update_singular', 'delete_singular'
+    journey_id_to_affect: Optional[str] = None # For singular update/delete
 ) -> List[Dict[str, Any]]:
     """
     Generates, updates, or deletes marketing journeys and updates the 'journeys' Supabase table.
-    Returns the updated list of journey records from Supabase.
+    Returns the updated list of journey records from Supabase (as this is the final save).
     """
     
-    current_journeys_from_db = await fetch_from_supabase('journeys')
-    current_campaigns_from_db = await fetch_from_supabase('campaigns') # Need campaigns for context
+    current_journeys_from_db = await fetch_from_supabase('journeys') # Still fetch to manage DB state
+    
+    # current_campaigns_from_db is replaced by `selected_campaign_data` parameter
 
     if action_type == "delete_singular":
         if journey_id_to_affect:
@@ -219,31 +218,21 @@ async def process_journeys(
 
     elif action_type == "update_singular":
         if not journey_id_to_affect:
-            print("No journey ID provided for singular update.")
             return await fetch_from_supabase('journeys')
 
         journey_to_update = next((j for j in current_journeys_from_db if j.get('id') == journey_id_to_affect), None)
         if not journey_to_update:
-            print(f"Journey with ID {journey_id_to_affect} not found for update.")
             return await fetch_from_supabase('journeys')
         
-        # Find the linked campaign for context
-        linked_campaign_name = journey_to_update.get('campaign_name')
-        linked_campaign = next((c for c in current_campaigns_from_db if c.get('name') == linked_campaign_name), None)
-
-        if not linked_campaign:
-            print(f"ERROR: Linked campaign '{linked_campaign_name}' not found for journey ID {journey_id_to_affect}.")
-            return await fetch_from_supabase('journeys')
-
         llm_response_list = await call_llm_for_journeys(
             api_key=API_KEY or "",
-            campaign_data=linked_campaign, # Provide the linked campaign for context
+            campaign_data=selected_campaign_data, # Provide the linked campaign for context
             user_prompt=user_prompt, # User's specific modification request
             current_journeys_for_llm=[journey_to_update] # Send the specific journey to modify
         )
 
         if llm_response_list:
-            updated_journey_data = llm_response_list[0] # Expecting only one updated journey
+            updated_journey_data = llm_response_list[0] 
             
             # Preserve the original ID and ensure last_edited is updated
             updated_journey_data['id'] = journey_id_to_affect 
@@ -264,37 +253,16 @@ async def process_journeys(
                 "last_edited": updated_journey_data.get('last_edited'),
             }
             await update_journeys_store(journey_id_to_affect, data_to_update)
-            print(f"\n--- Updated Single Journey (ID: {journey_id_to_affect}) ---")
-            print(f"Name: {data_to_update.get('name')}")
-            print(f"Campaign: {data_to_update.get('campaign_name')}")
-            print(f"Description: {data_to_update.get('description')}")
-            print(f"UX Type: {data_to_update.get('ux_type')}")
-            print(f"Channel: {data_to_update.get('channel')}")
-            print(f"Cohort: {data_to_update.get('cohort')}")
-            print(f"Outcome: {data_to_update.get('outcome_metric')}")
-            print(f"Lever: {data_to_update.get('lever')}")
-            print(f"Product: {data_to_update.get('product')}")
-            print(f"Last Edited: {data_to_update.get('last_edited')}")
-            print("-" * 30)
-            return await fetch_from_supabase('journeys')
-        else:
-            print(f"Could not generate update for journey ID {journey_id_to_affect}.")
         return await fetch_from_supabase('journeys')
 
     elif action_type == "generate":
-        if not campaign_id_for_generation:
-            print("No campaign ID provided for journey generation.")
+        if not selected_campaign_data:
             return await fetch_from_supabase('journeys')
         
-        selected_campaign = next((c for c in current_campaigns_from_db if c.get('id') == campaign_id_for_generation), None)
-        if not selected_campaign:
-            print(f"Campaign with ID {campaign_id_for_generation} not found for journey generation.")
-            return await fetch_from_supabase('journeys')
-
         generated_journeys_to_insert = []
         generated_ideas = await call_llm_for_journeys(
             api_key=API_KEY or "",
-            campaign_data=selected_campaign,
+            campaign_data=selected_campaign_data,
             user_prompt=user_prompt,
             current_journeys_for_llm=None # Not modifying existing, generating new
         )
@@ -307,106 +275,18 @@ async def process_journeys(
                 journey_item['last_edited'] = datetime.now().isoformat()
                 
                 # Ensure consistency with the campaign data that drove its generation
-                journey_item['campaign_name'] = selected_campaign.get('name')
-                journey_item['cohort'] = selected_campaign.get('target_cohort')
-                journey_item['lever'] = selected_campaign.get('lever_config')
-                journey_item['product'] = selected_campaign.get('product')
+                journey_item['campaign_name'] = selected_campaign_data.get('name')
+                journey_item['cohort'] = selected_campaign_data.get('target_cohort')
+                journey_item['lever'] = selected_campaign_data.get('lever_config')
+                journey_item['product'] = selected_campaign_data.get('product')
 
                 generated_journeys_to_insert.append(journey_item)
         
         if generated_journeys_to_insert:
             await insert_into_journeys_store(generated_journeys_to_insert)
 
-        updated_journeys = await fetch_from_supabase('journeys')
-        
-        print("\n--- Generated Journeys ---")
-        if updated_journeys:
-            for journey in updated_journeys:
-                print(f"ID: {journey.get('id')}")
-                print(f"Campaign Name: {journey.get('campaign_name')}")
-                print(f"Journey Name: {journey.get('name')}")
-                print(f"Description: {journey.get('description')}")
-                print(f"UX Type: {journey.get('ux_type')}")
-                print(f"Channel: {journey.get('channel')}")
-                print(f"Cohort: {journey.get('cohort')}")
-                print(f"Outcome Metric: {journey.get('outcome_metric')}")
-                print(f"Lever: {journey.get('lever')}")
-                print(f"Product: {journey.get('product')}")
-                print(f"Last Edited: {journey.get('last_edited')}")
-                print("-" * 30)
-        else:
-            print("No journeys generated or found.")
-            
-        return updated_journeys
+        return await fetch_from_supabase('journeys')
     
     return await fetch_from_supabase('journeys')
 
-
-# --- Test Function ---
-async def test_journey_generator():
-    print("Welcome to the Journey Generator Test!")
-    while True:
-        action = input("\nChoose action: (g)enerate new, (u)pdate singular, (d)elete singular, or (q)uit: ").lower()
-        
-        if action == 'q':
-            break
-        elif action == 'g':
-            campaigns = await fetch_from_supabase('campaigns')
-            if not campaigns:
-                print("No campaigns found. Please generate campaigns first.")
-                continue
-
-            print("\nAvailable Campaigns:")
-            for i, camp in enumerate(campaigns):
-                print(f"   {i+1}. ID: {camp.get('id')}, Name: {camp.get('name')}, Cohort: {camp.get('target_cohort')}")
-
-            campaign_choice = input("Enter campaign number to generate journeys for: ")
-            try:
-                camp_index = int(campaign_choice) - 1
-                if 0 <= camp_index < len(campaigns):
-                    chosen_campaign_id = campaigns[camp_index]['id']
-                    user_prompt = input("Enter an optional prompt for journey generation (e.g., 'Make it a 3-step email flow'): ")
-                    await process_journeys(user_prompt=user_prompt, campaign_id_for_generation=chosen_campaign_id, action_type="generate")
-                else:
-                    print("Invalid campaign number. Please try again.")
-            except ValueError:
-                print("Invalid input. Please enter a number for the campaign.")
-        
-        elif action == 'u':
-            current_journeys = await fetch_from_supabase('journeys')
-            if not current_journeys:
-                print("No journeys found to update.")
-                continue
-            print("\nCurrent Journeys:")
-            for jrny in current_journeys:
-                print(f"   ID: {jrny.get('id')}, Name: {jrny.get('name')}, Campaign: {jrny.get('campaign_name')}")
-            
-            jrny_id = input("Enter the ID of the journey to update: ")
-            update_prompt = input(f"Enter the new details/prompt for journey ID {jrny_id}: ")
-            await process_journeys(user_prompt=update_prompt, journey_id_to_affect=jrny_id, action_type="update_singular")
-        
-        elif action == 'd':
-            current_journeys = await fetch_from_supabase('journeys')
-            if not current_journeys:
-                print("No journeys found to delete.")
-                continue
-            print("\nCurrent Journeys:")
-            for jrny in current_journeys:
-                print(f"   ID: {jrny.get('id')}, Name: {jrny.get('name')}, Campaign: {jrny.get('campaign_name')}")
-            
-            jrny_id = input("Enter the ID of the journey to delete: ")
-            confirm = input(f"Are you sure you want to delete journey with ID {jrny_id}? (yes/no): ").lower()
-            if confirm == 'yes':
-                await process_journeys(journey_id_to_affect=jrny_id, action_type="delete_singular")
-            else:
-                print("Deletion cancelled.")
-        else:
-            print("Invalid action. Please choose from the available options.")
-
-# This block allows you to run the test function directly when the script is executed.
-if __name__ == "__main__":
-    if not API_KEY:
-        print("\nERROR: OPENAI_API_KEY environment variable is not set. Please set it in your .env file.")
-        exit(1) # Exit if API key is missing
-
-    asyncio.run(test_journey_generator())
+# Removed test_journey_generator and if __name__ == "__main__": block
