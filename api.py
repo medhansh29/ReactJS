@@ -130,13 +130,17 @@ async def generate_audiences(request: AudienceGenerateRequest):
     Returns the updated list of audience records for UI session memory.
     """
     try:
+        print(f"DEBUG: Calling process_audiences with action_type='generate'")
         updated_audiences = await process_audiences(
             user_prompt=request.user_prompt,
             current_audiences=request.current_audiences,
             action_type="generate"
         )
+        print(f"DEBUG: Type returned by process_audiences: {type(updated_audiences)}")
+
         return {"message": "Audiences generated successfully", "data": updated_audiences}
     except Exception as e:
+        print(f"ERROR in /audiences/generate: {e}") # Add this to see the full exception
         raise HTTPException(status_code=500, detail=f"Failed to generate audiences: {e}")
 
 @app.put("/audiences/modify")
@@ -333,3 +337,64 @@ async def finalize_campaign_flows(request: CampaignFlowFinalizeRequest):
         raise HTTPException(status_code=500, detail=f"Failed to finalize campaign flows: {e}")
 
 
+# Journey Endpoints (assuming process_journeys still handles direct DB interaction)
+@app.post("/journeys/generate")
+async def generate_journeys(request: JourneyGenerateRequest):
+    """
+    Generates new marketing journeys for a given campaign and saves to Supabase.
+    Returns the updated list of journey records from Supabase.
+    """
+    try:
+        # Assuming process_journeys exists and handles direct DB interaction as before
+        # Temporarily commenting out as process_journeys is not defined in this context
+        # updated_journeys = await process_journeys(
+        #     user_prompt=request.user_prompt,
+        #     selected_campaign_data=request.selected_campaign_data,
+        #     action_type="generate"
+        # )
+        # return {"message": "Journeys generated and saved successfully", "data": updated_journeys}
+        raise HTTPException(status_code=501, detail="Journey generation is not implemented yet.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate journeys: {e}")
+
+@app.put("/journeys/modify")
+async def modify_journey(request: JourneyModifyRequest):
+    """
+    Modifies a specific marketing journey by ID and updates in Supabase.
+    Returns the updated list of journey records from Supabase.
+    """
+    try:
+        # Assuming process_journeys exists and handles direct DB interaction as before
+        # Temporarily commenting out as process_journeys is not defined in this context
+        # updated_journeys = await process_journeys(
+        #     user_prompt=request.user_prompt,
+        #     selected_campaign_data=request.selected_campaign_data,
+        #     action_type="update_singular",
+        #     journey_id_to_affect=request.journey_id
+        # )
+        # return {"message": f"Journey {request.journey_id} modified successfully", "data": updated_journeys}
+        raise HTTPException(status_code=501, detail="Journey modification is not implemented yet.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to modify journey: {e}")
+
+@app.delete("/journeys/delete/{journey_id}")
+async def delete_journey(journey_id: str):
+    """
+    Deletes a specific marketing journey by ID from Supabase.
+    Returns the updated list of journey records from Supabase.
+    """
+    try:
+        # Assuming process_journeys exists and handles direct DB interaction as before
+        # Temporarily commenting out as process_journeys is not defined in this context
+        # updated_journeys = await process_journeys(
+        #     user_prompt="", # Not used for delete action type
+        #     selected_campaign_data={}, # Placeholder, as it's not strictly needed for delete journey from DB
+        #     action_type="delete_singular",
+        #     journey_id_to_affect=journey_id
+        # )
+        # return {"message": f"Journey {journey_id} deleted successfully", "data": updated_journeys}
+        raise HTTPException(status_code=501, detail="Journey deletion is not implemented yet.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete journey: {e}")
+
+# The if __name__ == "__main__": block is removed for production deployment with Gunicorn
