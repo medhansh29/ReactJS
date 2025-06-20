@@ -161,7 +161,7 @@ async def orchestrate_campaign_actions(
         Focus on creating synergistic combinations. Propose at least 3-5 new, diverse campaign flows.
         """
         chain = campaign_flow_prompt | llm | parser
-        response_obj = await chain.invoke({
+        response_obj = await chain.ainvoke({
             "user_prompt": user_prompt,
             "available_audiences_json": json.dumps(available_audiences, indent=2),
             "available_growth_levers_json": json.dumps(available_growth_levers, indent=2),
@@ -191,7 +191,7 @@ async def orchestrate_campaign_actions(
             raise HTTPException(status_code=404, detail=f"Campaign flow with ID {flow_id_to_affect} not found.")
 
         chain = campaign_flow_prompt | llm | parser
-        response_obj = await chain.invoke({
+        response_obj = await chain.ainvoke({
             "user_prompt": user_prompt,
             "available_audiences_json": json.dumps(available_audiences, indent=2),
             "available_growth_levers_json": json.dumps(available_growth_levers, indent=2),

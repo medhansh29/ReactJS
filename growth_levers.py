@@ -124,7 +124,7 @@ async def orchestrate_growth_lever_actions(
         Propose at least 3-5 new, diverse growth levers.
         """
         chain = growth_lever_prompt | llm | parser
-        response = await chain.invoke({
+        response = await chain.ainvoke({
             "user_prompt": user_prompt,
             "current_growth_levers_json": json.dumps(current_growth_levers, indent=2),
             "action_instructions": action_instructions,
@@ -147,7 +147,7 @@ async def orchestrate_growth_lever_actions(
             raise HTTPException(status_code=404, detail=f"Growth lever with ID {growth_lever_id_to_affect} not found.")
 
         chain = growth_lever_prompt | llm | parser
-        response = await chain.invoke({
+        response = await chain.ainvoke({
             "user_prompt": user_prompt,
             "current_growth_levers_json": json.dumps([lever_to_modify], indent=2),
             "action_instructions": action_instructions,
