@@ -3,15 +3,20 @@ import os
 from typing import List, Dict, Any, Optional
 import uuid
 import asyncio
+from datetime import datetime
+import random # Import random for inventing numbers
 
-from dotenv import load_dotenv
-load_dotenv() # Load environment variables from .env file
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 from supabase import create_client, Client
+from fastapi import HTTPException
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 # --- Configuration ---
 API_KEY = os.getenv('OPENAI_API_KEY')
@@ -24,252 +29,192 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable must be set.")
 
-# Initialize Supabase client (only used for read-only contextual data)
+# Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # --- Pydantic Models for Structured Output ---
 
 class AudienceType(BaseModel):
-    """Represents a suggested audience type with its rationale."""
-    # Added 'id' field for consistency with UI memory and modification
+    """Represents a suggested audience type with its rationale and rule definition."""
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique ID for the audience type.")
     type: str = Field(description="A descriptive and concise name for the audience type (e.g., 'Eco-conscious Urban Professionals').")
-    rationale: str = Field(description="A detailed explanation of why this audience is suitable, referencing product, customer, and campaign data.")
-    audience_size: Optional[int] = Field(default=None, description="Approximate size of the audience.") # Added audience_size for UI
+    rationale: str = Field(description="The strategic reasoning and justification for targeting this audience.")
+    rule: Dict[str, Any] = Field(description="A JSON object defining the segmentation rules for this audience (e.g., {'location': 'urban', 'interests': ['eco-friendly', 'sustainability']}).")
+    audience_size: Optional[int] = Field(None, description="Estimated size of the audience cohort (e.g., 500000).")
+    cohort_score: Optional[float] = Field(None, description="A numerical score indicating the potential value or strategic importance of this cohort (e.g., 0.75).")
+    cohort_rationale: Optional[str] = Field(None, description="Explanation for the assigned cohort score.")
 
+class SuggestedAudiencesOutput(BaseModel):
+    """Represents the output structure for suggested audience types."""
+    suggested_audiences: List[AudienceType] = Field(description="A list of generated audience types.")
 
-class AudienceTypes(BaseModel):
-    """A list of suggested audience types."""
-    audiences: List[AudienceType] = Field(description="A list of distinct audience types.")
+# --- LLM Setup ---
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=SecretStr(API_KEY))
+parser = PydanticOutputParser(pydantic_object=SuggestedAudiencesOutput)
 
-# --- Supabase Helper Functions (Only fetch for contextual read-only data) ---
+audience_template = """
+You are an expert marketing strategist. Your task is to generate and refine audience types based on user prompts and existing audience data.
 
-async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Fetches data from a specified Supabase table, optionally by ID.
-    This function is retained only for fetching *read-only* contextual data.
-    """
-    try:
-        query = supabase.from_(table_name).select('*')
-        if id:
-            query = query.eq('id', id)
-        response = query.execute()
-        if response and hasattr(response, 'data'):
-            return response.data
-        return []
-    except Exception as e:
-        return []
+Current Date and Time: {current_datetime}
 
-# Removed insert_into_audience_store
-# Removed update_audience_store
-# Removed delete_from_supabase (as it was only used for audience_store in this file)
+Here is the user's request: "{user_prompt}"
 
-def calculate_audience_size(audience_type: Dict[str, str], cohort_data_from_store: List[Dict]) -> int:
-    """
-    Approximates audience size by finding the closest matching cohort in cohort_data_from_store.
-    If no good match, uses the average cohort size.
-    """
-    if not cohort_data_from_store:
-        return 0
+---
+Existing Audiences in Session (for context and modification if applicable):
+{current_audiences_json}
+---
 
-    # Calculate average cohort size
-    total_cohort_size = sum(c.get('cohort_size', 0) for c in cohort_data_from_store if c.get('cohort_size') is not None)
-    num_cohorts = len(cohort_data_from_store)
-    average_cohort_size = total_cohort_size / num_cohorts if num_cohorts > 0 else 0
+Based on the user's prompt, perform the following action:
+{action_instructions}
 
-    audience_type_lower = audience_type['type'].lower()
-    rationale_lower = audience_type['rationale'].lower()
-    
-    best_match_score = 0
-    matched_cohort_size = 0
+When generating or updating, ensure each audience type has:
+- 'id': A unique identifier (if generating, create a new UUID; if updating, use the existing one).
+- 'type': A concise name (e.g., "Tech-Savvy Millennials").
+- 'rationale': Strategic justification.
+- 'rule': A JSON object for segmentation (e.g., {{"age_range": "25-40", "interests": ["technology", "gaming"]}}).
+- 'audience_size': An estimated numerical size (invent if generating).
+- 'cohort_score': A numerical score between 0.0 and 1.0 (invent if generating).
+- 'cohort_rationale': Explanation for the cohort score.
 
-    audience_keywords = set(audience_type_lower.split() + rationale_lower.split())
+{format_instructions}
+"""
 
-    for cohort in cohort_data_from_store:
-        cohort_name = cohort.get('cohort_name', '').lower()
-        cohort_size = cohort.get('cohort_size', 0)
-        
-        cohort_keywords = set(cohort_name.split())
-        
-        current_score = len(audience_keywords.intersection(cohort_keywords))
-        
-        # Consider specific phrases or product names from rationale if they appear in query/cohort_name
-        if "beard" in rationale_lower and "beard" in cohort_name:
-            current_score += 1
-        if "skincare" in rationale_lower and "skincare" in cohort_name:
-            current_score += 1
-        if "sunscreen" in rationale_lower and "sunscreen" in cohort_name:
-            current_score += 1
-        if "bb cream" in rationale_lower and "bb cream" in cohort_name:
-            current_score += 1
+audience_prompt = ChatPromptTemplate.from_template(template=audience_template)
 
-        if current_score > best_match_score:
-            best_match_score = current_score
-            matched_cohort_size = cohort_size
-
-    if best_match_score >= 1: # At least one keyword match
-        return matched_cohort_size
-    else:
-        return int(average_cohort_size)
-
-
-async def call_llm_for_audiences(
-    prompt_text: str,
-    api_key: str,
-    product_summary: str,
-    customer_demographics_summary: str,
-    business_context_summary: str,
-    current_audiences_for_llm: Optional[List[Dict[str, Any]]] = None # Current state from UI memory
-) -> List[Dict[str, Any]]:
-    """Calls the OpenAI LLM for audience generation/modification, with reduced context."""
-    llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key)) 
-    parser = PydanticOutputParser(pydantic_object=AudienceTypes)
-    format_instructions = parser.get_format_instructions()
-
-    template_variables = {
-        "format_instructions": format_instructions,
-        "product_summary": product_summary,
-        "customer_demographics_summary": customer_demographics_summary,
-        "business_context_summary": business_context_summary,
-    }
-
-    if current_audiences_for_llm:
-        full_prompt_template = """
-        The user wants to modify the current audience suggestions. Here are the current audience types:
-        {current_audiences_json}
-
-        The user's request for modification is: "{user_modification_prompt}"
-
-        Based on this, please provide an updated list of audience types.
-        Maintain the JSON array format as specified by the output instructions.
-        If a type needs to be removed, omit it. If a new type is requested, add it.
-        If an existing type needs its rationale or name changed, update it.
-        Ensure the output strictly adheres to the JSON schema.
-        For each audience, provide a descriptive name for the 'type' field and an 'id'.
-
-        Limited Context Data:
-        Product Summary: {product_summary}
-        Customer Demographics Summary: {customer_demographics_summary}
-        Business Context Summary: {business_context_summary}
-
-        {format_instructions}
-        """
-        # Ensure 'id' is included when passing current audiences to LLM for modification
-        audiences_with_id_for_llm = [
-            {"id": aud.get('id'), "type": aud.get('type', ''), "rationale": aud.get('rationale', '')}
-            for aud in current_audiences_for_llm
-        ]
-        template_variables["current_audiences_json"] = json.dumps(audiences_with_id_for_llm, indent=2)
-        template_variables["user_modification_prompt"] = prompt_text
-    else:
-        full_prompt_template = """
-        Analyze the provided summarized product data, customer demographics, and business context below.
-        Based on the user's input "{user_initial_prompt}", suggest 3-5 distinct audience types.
-        For each type, provide a descriptive name and a detailed rationale explaining why this audience is suitable,
-        referencing the provided summarized data.
-        The 'id' field should be omitted or set to null for new audience types.
-        The output must strictly adhere to the JSON schema below.
-
-        Limited Context Data:
-        Product Summary: {product_summary}
-        Customer Demographics Summary: {customer_demographics_summary}
-        Business Context Summary: {business_context_summary}
-
-        {format_instructions}
-        """
-        template_variables["user_initial_prompt"] = prompt_text
-
-    prompt = ChatPromptTemplate.from_template(full_prompt_template)
-    chain = prompt | llm | parser
-    try:
-        response = await chain.ainvoke(template_variables)
-        return [aud.model_dump() for aud in response.audiences]
-    except Exception as e:
-        return []
-
-async def process_audiences(
+# --- Main Orchestration Function ---
+async def orchestrate_audience_actions(
     user_prompt: str,
-    current_audiences: List[Dict[str, Any]], # Now passed from UI's session memory
-    action_type: str, # 'generate', 'update_singular', 'delete_singular'
-    audience_id_to_affect: Optional[str] = None # For singular update/delete
-) -> List[Dict[str, Any]]: 
+    current_audiences: List[Dict[str, Any]],
+    action_type: str,
+    audience_id_to_affect: Optional[str] = None,
+    updated_by_user_id: Optional[str] = None,
+    action_finalize: Optional[str] = None # Added for finalize action
+) -> List[Dict[str, Any]]:
     """
-    Generates, modifies, or deletes audience types in memory.
-    Returns the updated list of audience records for UI session memory.
+    Orchestrates actions related to audience types: generate (suggest), update, delete, or finalize (save to DB).
+
+    Args:
+        user_prompt (str): The prompt from the user.
+        current_audiences (List[Dict[str, Any]]): The current list of audience records from UI session memory.
+        action_type (str): The type of action to perform ('generate' -> 'suggest', 'update_singular', 'delete_singular', 'finalize').
+        audience_id_to_affect (Optional[str]): The ID of the audience to affect for update/delete.
+        updated_by_user_id (Optional[str]): User ID for tracking who finalized the data.
+        action_finalize (Optional[str]): Specific action for finalize ('overwrite').
+
+    Returns:
+        List[Dict[str, Any]]: The updated list of audience records for UI session memory.
     """
-    # Fetch data required for internal logic (like size calculation)
-    cohort_data = await fetch_from_supabase('cohort_store')
-    
-    # --- Fetch and Summarize Contextual Data for LLM ---
-    product_data_raw = await fetch_from_supabase('product_store')
-    feature_store_data_raw = await fetch_from_supabase('feature_store')
-    business_context_data_raw = await fetch_from_supabase('business_context_store')
+    updated_audiences_list = [AudienceType(**aud).model_dump() if not isinstance(aud, AudienceType) else aud for aud in current_audiences]
 
-    # Simple summarization: You can enhance this based on data structure
-    product_summary = "Available products: " + ", ".join([p.get('name', '') for p in product_data_raw[:5]]) + "..." if product_data_raw else "No product data."
-    feature_summary = "Key features mentioned: " + ", ".join([f.get('name', '') for f in feature_store_data_raw[:5]]) + "..." if feature_store_data_raw else "No feature data."
-    business_context_summary = "Business goals/details: " + ", ".join([bc.get('context_detail', '') for bc in business_context_data_raw[:2]]) + "..." if business_context_data_raw else "No business context."
-    
-    customer_demographics_summary = "Customer cohorts include: " + ", ".join([c.get('cohort_name', '') for c in cohort_data[:5]]) + " with varying sizes." if cohort_data else "No customer demographics."
+    current_datetime = datetime.now().isoformat()
 
-    llm_context_product = product_summary
-    llm_context_customer_demographics = customer_demographics_summary
-    llm_context_business_context = business_context_summary + " " + feature_summary
+    action_instructions = ""
 
-    updated_audiences_list = list(current_audiences) # Create a mutable copy of session memory
-
-    if action_type == "delete_singular":
-        if audience_id_to_affect:
-            updated_audiences_list = [aud for aud in updated_audiences_list if aud.get('id') != audience_id_to_affect]
-        return updated_audiences_list
+    if action_type == "generate": # This will now act as 'suggest'
+        action_instructions = """
+        Generate new, distinct audience types based on the user's prompt. Do not regenerate existing ones unless explicitly asked to modify them.
+        Provide at least 3-5 new, diverse audience types.
+        """
+        chain = audience_prompt | llm | parser
+        response = await chain.invoke({
+            "user_prompt": user_prompt,
+            "current_audiences_json": json.dumps(current_audiences, indent=2),
+            "action_instructions": action_instructions,
+            "format_instructions": parser.get_format_instructions(),
+            "current_datetime": current_datetime
+        })
+        new_audiences = [aud.model_dump() for aud in response.suggested_audiences]
+        # Append new audiences, ensuring no duplicates if IDs are generated
+        existing_ids = {aud.get("id") for aud in updated_audiences_list if aud.get("id")}
+        for new_aud in new_audiences:
+            if new_aud.get("id") and new_aud["id"] not in existing_ids:
+                updated_audiences_list.append(new_aud)
 
     elif action_type == "update_singular":
-        if not audience_id_to_affect:
-            return updated_audiences_list
+        action_instructions = f"""
+        Modify the audience with ID '{audience_id_to_affect}' based on the user's prompt.
+        Only return the modified audience object. Ensure its ID remains '{audience_id_to_affect}'.
+        """
+        # Find the specific audience to modify
+        audience_to_modify = next((aud for aud in updated_audiences_list if aud.get("id") == audience_id_to_affect), None)
+        if not audience_to_modify:
+            raise HTTPException(status_code=404, detail=f"Audience with ID {audience_id_to_affect} not found.")
 
-        audience_to_update = next((aud for aud in updated_audiences_list if aud.get('id') == audience_id_to_affect), None)
-        if audience_to_update:
-            llm_response_list = await call_llm_for_audiences(
-                prompt_text=user_prompt,
-                api_key=API_KEY or "",
-                product_summary=llm_context_product,
-                customer_demographics_summary=llm_context_customer_demographics,
-                business_context_summary=llm_context_business_context,
-                current_audiences_for_llm=[audience_to_update] # Pass the single audience for modification
-            )
-            if llm_response_list:
-                updated_aud_data = llm_response_list[0]
-                size = calculate_audience_size(updated_aud_data, cohort_data)
-                
-                # Update the audience in the list
-                for i, aud in enumerate(updated_audiences_list):
-                    if aud.get('id') == audience_id_to_affect:
-                        updated_aud_data['id'] = audience_id_to_affect # Preserve ID
-                        updated_aud_data['audience_size'] = size # Update size
-                        updated_audiences_list[i] = updated_aud_data
-                        break
-        return updated_audiences_list
+        # Temporarily use only the audience to be modified for focused LLM output
+        chain = audience_prompt | llm | parser
+        response = await chain.invoke({
+            "user_prompt": user_prompt,
+            "current_audiences_json": json.dumps([audience_to_modify], indent=2), # Pass only the relevant audience
+            "action_instructions": action_instructions,
+            "format_instructions": parser.get_format_instructions(),
+            "current_datetime": current_datetime
+        })
 
-    elif action_type == "generate":
-        suggested_audiences_raw = await call_llm_for_audiences(
-            prompt_text=user_prompt,
-            api_key=API_KEY or "",
-            product_summary=llm_context_product,
-            customer_demographics_summary=llm_context_customer_demographics,
-            business_context_summary=llm_context_business_context,
-            current_audiences_for_llm=None # Generating new, no existing context from LLM's perspective
-        )
+        if response.suggested_audiences:
+            modified_audience = response.suggested_audiences[0].model_dump()
+            # Replace the old audience with the modified one
+            updated_audiences_list = [
+                modified_audience if aud.get("id") == audience_id_to_affect else aud
+                for aud in updated_audiences_list
+            ]
+        else:
+            print(f"LLM did not return a modified audience for ID {audience_id_to_affect}. Original list returned.")
 
-        if suggested_audiences_raw:
-            for suggested_aud in suggested_audiences_raw:
-                if 'id' not in suggested_aud or not suggested_aud['id']:
-                    suggested_aud['id'] = str(uuid.uuid4()) # Ensure new ID for new items
-                
-                # Calculate size for newly generated audiences
-                suggested_aud['audience_size'] = calculate_audience_size(suggested_aud, cohort_data)
-                updated_audiences_list.append(suggested_aud)
-        return updated_audiences_list
-    
-    return updated_audiences_list # Return current list if action_type is not recognized
 
-# Removed test_audience_analyser and if __name__ == "__main__": block
+    elif action_type == "delete_singular":
+        if audience_id_to_affect:
+            updated_audiences_list = [
+                aud for aud in updated_audiences_list if aud.get("id") != audience_id_to_affect
+            ]
+        else:
+            raise ValueError("Audience ID is required for delete_singular action.")
+
+    elif action_type == "finalize":
+        if not updated_by_user_id:
+            raise ValueError("User ID is required for finalize action.")
+
+        try:
+            data_to_save = []
+            for aud in updated_audiences_list:
+                data_to_save.append({
+                    "id": aud.get("id"),
+                    "name": aud.get("type"), # Renamed from 'type' to 'name' for Supabase
+                    "rationale": aud.get("rationale"),
+                    "rule": json.dumps(aud.get("rule", {})), # Store JSON as string in Supabase
+                    "estimated_size": aud.get("audience_size"),
+                    "cohort_score": aud.get("cohort_score"),
+                    "cohort_rationale": aud.get("cohort_rationale"),
+                    "user_id": updated_by_user_id,
+                    "timestamp": datetime.now().isoformat()
+                })
+
+            response = supabase.table("audience_store").upsert(data_to_save, on_conflict="id").execute()
+
+            if response.data:
+                print(f"Successfully saved {len(response.data)} audiences to Supabase.")
+            else:
+                print("No data returned after upsert, check Supabase operation.")
+
+        except Exception as e:
+            print(f"An unexpected error occurred during finalize action: {e}")
+            # Depending on error handling strategy, you might want to re-raise or return an error state.
+            raise HTTPException(status_code=500, detail=f"Failed to finalize audiences to Supabase: {e}")
+
+
+    # Ensure the returned list is always consistent with the expected AudienceType schema for UI
+    # This step reformats the data back to the UI's expected structure if any internal changes occurred.
+    final_formatted_audiences = []
+    for aud in updated_audiences_list:
+        final_formatted_audiences.append({
+            "id": aud.get("id"),
+            "name": aud.get("type") if aud.get("type") else aud.get("name"), # Prefer 'type' from LLM, fall back to 'name' from DB
+            "rule": aud.get("rule", {}),
+            "estimated_size": aud.get("audience_size"),
+            "estimated_conversion_rate": aud.get("estimated_conversion_rate", round(random.uniform(0.05, 0.25), 2)), # Retain if exists, else invent
+            "rationale": aud.get("rationale"),
+            "top_features": aud.get("top_features", []),
+            "cohort_score": aud.get("cohort_score"),
+            "cohort_rationale": aud.get("cohort_rationale"),
+        })
+
+    return final_formatted_audiences

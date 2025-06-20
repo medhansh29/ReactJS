@@ -3,6 +3,8 @@ import os
 from typing import List, Dict, Any, Optional
 import uuid
 import asyncio
+from datetime import datetime
+import random # Import random for inventing numbers
 
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
@@ -12,6 +14,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr, ValidationError
 from supabase import create_client, Client
+from fastapi import HTTPException
 
 # --- Configuration ---
 API_KEY = os.getenv('OPENAI_API_KEY')
@@ -24,272 +27,255 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable must be set.")
 
-# Initialize Supabase client (only used for read-only contextual data)
+# Initialize Supabase client (only used for read-only contextual data for generation)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # --- Pydantic Models for Structured Output ---
 
-class CampaignIdea(BaseModel):
-    """Represents a generated campaign idea, matching the 'campaigns' table schema (for UI memory)."""
-    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), description="Unique ID for the campaign idea.")
-    name: str = Field(description="A descriptive name for the campaign idea.")
-    description: str = Field(description="Specific details and actions for this campaign.")
-    hypothesis: str = Field(description="Explanation of why this campaign is effective for the chosen audience, growth lever, and product.")
-    target_cohort: str = Field(description="The title of the target audience for this campaign.")
-    lever_config: str = Field(description="The type of the growth lever used for this campaign.")
-    product: str = Field(description="The name of the product this campaign is targeting.")
-    discount_percentage: Optional[float] = Field(
-        default=None,
-        description="The exact discount percentage for this campaign (e.g., 10.5 for 10.5%). Null if not applicable."
-    )
-    audience_id: str = Field(description="The ID of the target audience used for this campaign.")
-    growth_lever_id: str = Field(description="The ID of the growth lever used for this campaign.")
-    product_id: str = Field(description="The ID of the product targeted by this campaign.")
+class FlowDetail(BaseModel):
+    """Represents the detailed steps or structure of a campaign flow."""
+    steps: List[str] = Field(description="A list of steps in the campaign flow (e.g., 'Email 1: Welcome', 'In-App Message: Discount Offer').")
+
+class FlowCampaign(BaseModel):
+    """Represents a suggested campaign flow combining audience, growth lever, and product."""
+    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), alias="flow_id", description="Unique ID for the campaign flow.")
+    name: str = Field(description="A concise and descriptive name for the campaign flow (e.g., 'New User Onboarding for Eco-conscious Shoppers').")
+    description: str = Field(description="A brief description of the campaign's purpose and target.")
+    target_audience_id: str = Field(description="The ID of the target audience for this campaign.")
+    growth_lever_id: str = Field(description="The ID of the primary growth lever utilized in this campaign.")
+    product_context: str = Field(description="Contextual information about the product relevant to this campaign (e.g., 'Sustainable fashion line').")
+    flow_detail: FlowDetail = Field(description="Detailed steps or structure of the campaign flow.")
+    estimated_reach: Optional[int] = Field(None, description="Estimated number of users reached by this campaign.")
+    expected_ctr: Optional[float] = Field(None, description="Expected Click-Through Rate (e.g., 0.03 for 3%).")
+    expected_conversion_rate: Optional[float] = Field(None, description="Expected Conversion Rate (e.g., 0.015 for 1.5%).")
+    # Added for UI consistency
+    audience_name: Optional[str] = Field(None, description="Name of the target audience (for display purposes, fetched from DB).")
+    growth_lever_type: Optional[str] = Field(None, description="Type of the growth lever (for display purposes, fetched from DB).")
 
 
-class CampaignIdeas(BaseModel):
-    """A list of generated campaign ideas."""
-    campaign_ideas: List[CampaignIdea] = Field(description="A list of 1-2 distinct campaign ideas.")
+class SuggestedFlowsOutput(BaseModel):
+    """Represents the output structure for suggested campaign flows."""
+    suggested_flows: List[FlowCampaign] = Field(description="A list of generated campaign flows.")
+    status: str = Field("success", description="Status of the generation process (success or error).")
+    message: Optional[str] = Field(None, description="Additional message or error details.")
 
-# --- Supabase Helper Functions (Only fetch for contextual read-only data) ---
+# --- LLM Setup ---
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=SecretStr(API_KEY))
+parser = PydanticOutputParser(pydantic_object=SuggestedFlowsOutput)
 
-async def fetch_from_supabase(table_name: str, id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Fetches data from a specified Supabase table, optionally by ID.
-    This function is retained only for fetching *read-only* contextual data.
-    """
+campaign_flow_template = """
+You are an expert campaign strategist. Your task is to generate and refine comprehensive campaign flows by synergizing audience insights, growth levers, and product context.
+
+Current Date and Time: {current_datetime}
+
+Here is the user's request: "{user_prompt}"
+
+---
+Available Audiences (for contextual understanding and to pick IDs from):
+{available_audiences_json}
+
+Available Growth Levers (for contextual understanding and to pick IDs from):
+{available_growth_levers_json}
+
+Existing Campaign Flows in Session (for context and modification if applicable):
+{current_campaign_flows_json}
+---
+
+Based on the user's prompt and the provided data, perform the following action:
+{action_instructions}
+
+When generating or updating, ensure each campaign flow has:
+- 'flow_id': A unique identifier (if generating, create a new UUID; if updating, use the existing one).
+- 'name': A concise name for the campaign flow.
+- 'description': A brief description.
+- 'target_audience_id': **Crucially, this must be one of the 'id' values from the `available_audiences`**.
+- 'growth_lever_id': **Crucially, this must be one of the 'growth_lever_id' values from the `available_growth_levers`**.
+- 'product_context': Specific product context.
+- 'flow_detail': An object with 'steps' (a list of actions).
+- 'estimated_reach': An invented numerical value.
+- 'expected_ctr': An invented numerical float (e.g., 0.03).
+- 'expected_conversion_rate': An invented numerical float (e.g., 0.015).
+
+If you are asked to generate, generate new, distinct campaign flows. Do not regenerate existing ones unless explicitly asked to modify them.
+If you are asked to modify, ensure you use the exact 'flow_id' provided.
+
+{format_instructions}
+"""
+
+campaign_flow_prompt = ChatPromptTemplate.from_template(template=campaign_flow_template)
+
+# --- Helper Functions to Fetch Data from Supabase ---
+async def fetch_audiences_from_supabase():
+    """Fetches all audience data from Supabase."""
     try:
-        query = supabase.from_(table_name).select('*')
-        if id:
-            query = query.eq('id', id)
-        response = query.execute()
-        if response and hasattr(response, 'data'):
-            return response.data
-        return []
+        response = supabase.table("audience_store").select("*").execute()
+        return response.data if response.data else []
     except Exception as e:
+        print(f"Error fetching audiences from Supabase: {e}")
         return []
 
-# Removed insert_into_campaigns_store
-# Removed update_campaigns_store
-# Removed delete_from_supabase (as it was only used for campaigns in this file)
-
-# --- LLM Call Function ---
-
-async def call_llm_for_campaign_ideas(
-    api_key: str,
-    selected_audience_data: Dict[str, Any], # Now mandatory, passed from UI memory
-    selected_growth_lever_data: Dict[str, Any], # Now mandatory, passed from UI memory
-    selected_product_data: Dict[str, Any], # Now mandatory, passed from UI memory
-    user_prompt: str = "",
-    current_campaign_ideas_for_llm: Optional[List[Dict[str, Any]]] = None # Current state from UI memory
-) -> List[Dict[str, Any]]:
-    """Calls the OpenAI LLM to generate or modify campaign ideas with minimal, relevant data."""
-    llm = ChatOpenAI(model="gpt-4o", api_key=SecretStr(api_key) if api_key else None)
-    parser = PydanticOutputParser(pydantic_object=CampaignIdeas)
-    format_instructions = parser.get_format_instructions()
-    
-    template_variables = {
-        "format_instructions_var": format_instructions,
-        "user_prompt": user_prompt,
-    }
-
-    if current_campaign_ideas_for_llm: # Modification mode
-        full_prompt_template_str = """
-        Based on the current campaign ideas and the user's request, please provide an UPDATED list of campaign ideas.
-        The user's request for modification is: "{user_prompt}"
-
-        Current Campaign Ideas (only the one(s) to be modified):
-        {current_campaign_ideas_json}
-        
-        Ensure the output strictly adheres to the JSON schema, preserving the 'id' of existing campaigns and setting it to null for new ones if any are created.
-        If the user implies removal of a specific ID, omit it from the returned list.
-        If a new idea is requested, add it (with a null 'id').
-        If an existing idea needs its fields changed, update it.
-        
-        {format_instructions_var}
-        """
-        # Ensure 'id' is included when passing current campaigns to LLM for modification
-        campaigns_with_id_for_llm = [
-            {k: v for k, v in camp.items()} # Copy all items including 'id'
-            for camp in current_campaign_ideas_for_llm
-        ]
-        template_variables["current_campaign_ideas_json"] = json.dumps(campaigns_with_id_for_llm, indent=2)
-    else: # Generation mode
-        # These fields are guaranteed to be present as they are passed from UI's memory
-        audience_title = selected_audience_data.get('title', 'N/A')
-        growth_lever_type = selected_growth_lever_data.get('type', 'N/A')
-        product_name = selected_product_data.get('name', 'N/A')
-        discount_percentage = selected_growth_lever_data.get('exact_discount_percentage')
-
-        full_prompt_template_str = """
-        Based on the following *specifically selected* audience, growth lever, and product details, generate 1-2 compelling campaign ideas.
-        If the user has a specific request, integrate it.
-
-        Selected Audience:
-        Title: {audience_title}
-        Rationale: {audience_rationale}
-        Size: {audience_size}
-        Audience ID: {audience_id}
-
-        Selected Growth Lever:
-        Type: {growth_lever_type}
-        Details: {growth_lever_details}
-        Rationale: {growth_lever_rationale}
-        Discount Percentage: {discount_percentage}
-        Growth Lever ID: {growth_lever_id}
-
-        Selected Product:
-        Name: {product_name}
-        Product ID: {product_id}
-        Product Description: {product_description}
-
-        User's Specific Request (if any): "{user_prompt}"
-
-        Please generate 1-2 campaign ideas in the following JSON array format.
-        For each campaign idea, ensure:
-        - 'id' field is omitted or set to null (will be generated by the system if new).
-        - 'name': A concise title.
-        - 'description': Specific details and execution steps.
-        - 'hypothesis': Why this campaign will be effective, referencing the provided audience, lever, and product details.
-        - 'target_cohort': Must be exactly "{audience_title}".
-        - 'lever_config': Must be exactly "{growth_lever_type}".
-        - 'product': Must be exactly "{product_name}".
-        - 'discount_percentage': Set to {discount_percentage} if applicable, otherwise null.
-        - 'audience_id': Must be exactly "{audience_id}".
-        - 'growth_lever_id': Must be exactly "{growth_lever_id}".
-        - 'product_id': Must be exactly "{product_id}".
-
-        {format_instructions_var}
-        """
-        template_variables.update(
-            **{
-                "audience_title": audience_title,
-                "audience_rationale": selected_audience_data.get('rationale'),
-                "audience_size": selected_audience_data.get('audience_size'),
-                "audience_id": selected_audience_data.get('id'),
-
-                "growth_lever_type": growth_lever_type,
-                "growth_lever_details": selected_growth_lever_data.get('details'),
-                "growth_lever_rationale": selected_growth_lever_data.get('rationale'),
-                "growth_lever_id": selected_growth_lever_data.get('id'),
-                "discount_percentage": discount_percentage,
-
-                "product_name": product_name,
-                "product_id": selected_product_data.get('id'),
-                "product_description": selected_product_data.get('description'),
-            }
-        )
-
-    prompt = ChatPromptTemplate.from_template(full_prompt_template_str)
-    chain = prompt | llm | parser
+async def fetch_growth_levers_from_supabase():
+    """Fetches all growth lever data from Supabase."""
     try:
-        response = await chain.ainvoke(template_variables)
-        return [idea.model_dump() for idea in response.campaign_ideas]
-    except ValidationError as e:
-        # Removed print statement for production readiness
-        return []
+        response = supabase.table("growth_levers_store").select("*").execute()
+        return response.data if response.data else []
     except Exception as e:
-        # Removed print statement for production readiness
+        print(f"Error fetching growth levers from Supabase: {e}")
         return []
 
-async def process_campaign_ideas(
-    current_campaigns: List[Dict[str, Any]], # Now passed from UI's session memory
-    user_prompt: str = "",
-    action_type: str = "generate", # 'generate', 'update_singular', 'delete_singular'
-    # For generation: combo of full data, not just IDs
-    selected_combinations_data: Optional[List[Dict[str, Any]]] = None, 
-    campaign_id_to_affect: Optional[str] = None # For singular update/delete
+# --- Main Orchestration Function ---
+async def orchestrate_campaign_actions(
+    user_prompt: str,
+    current_campaign_flows: List[Dict[str, Any]],
+    action_type: str,
+    flow_id_to_affect: Optional[str] = None,
+    updated_by_user_id: Optional[str] = None,
+    action_finalize: Optional[str] = None # Added for finalize action
 ) -> List[Dict[str, Any]]:
     """
-    Generates, updates, or deletes campaign ideas in memory.
-    Returns the updated list of campaign records for UI session memory.
-    """
-    updated_campaigns_list = list(current_campaigns) # Create a mutable copy
+    Orchestrates actions related to campaign flows: generate (suggest), update, delete, or finalize (save to DB).
 
-    if action_type == "delete_singular":
-        if campaign_id_to_affect:
-            updated_campaigns_list = [c for c in updated_campaigns_list if c.get('id') != campaign_id_to_affect]
-        return updated_campaigns_list
+    Args:
+        user_prompt (str): The prompt from the user.
+        current_campaign_flows (List[Dict[str, Any]]): The current list of campaign flows from UI session memory.
+        action_type (str): The type of action to perform ('generate' -> 'suggest', 'update_singular', 'delete_singular', 'finalize').
+        flow_id_to_affect (Optional[str]): The ID of the campaign flow to affect for update/delete.
+        updated_by_user_id (Optional[str]): User ID for tracking who finalized the data.
+        action_finalize (Optional[str]): Specific action for finalize ('overwrite').
+
+    Returns:
+        List[Dict[str, Any]]: The updated list of campaign flow records for UI session memory.
+    """
+    updated_flows_list = [FlowCampaign(**flow).model_dump(by_alias=True) if not isinstance(flow, FlowCampaign) else flow for flow in current_campaign_flows]
+    current_datetime = datetime.now().isoformat()
+    action_instructions = ""
+
+    # Fetch available audiences and growth levers for contextualization
+    available_audiences = await fetch_audiences_from_supabase()
+    available_growth_levers = await fetch_growth_levers_from_supabase()
+
+    if action_type == "generate": # This will now act as 'suggest'
+        action_instructions = """
+        Generate new, distinct campaign flows based on the user's prompt. Do not regenerate existing ones.
+        Each generated campaign flow must use one of the provided 'target_audience_id' and 'growth_lever_id' from the available lists.
+        Focus on creating synergistic combinations. Propose at least 3-5 new, diverse campaign flows.
+        """
+        chain = campaign_flow_prompt | llm | parser
+        response_obj = await chain.invoke({
+            "user_prompt": user_prompt,
+            "available_audiences_json": json.dumps(available_audiences, indent=2),
+            "available_growth_levers_json": json.dumps(available_growth_levers, indent=2),
+            "current_campaign_flows_json": json.dumps(current_campaign_flows, indent=2),
+            "action_instructions": action_instructions,
+            "format_instructions": parser.get_format_instructions(),
+            "current_datetime": current_datetime
+        })
+
+        if response_obj.status == "success" and response_obj.suggested_flows:
+            new_flows = [flow.model_dump(by_alias=True) for flow in response_obj.suggested_flows]
+            existing_ids = {flow.get("flow_id") for flow in updated_flows_list if flow.get("flow_id")}
+            for new_flow in new_flows:
+                if new_flow.get("flow_id") and new_flow["flow_id"] not in existing_ids:
+                    updated_flows_list.append(new_flow)
+        else:
+            print(f"LLM did not return new campaign flows: {response_obj.message}")
+
 
     elif action_type == "update_singular":
-        if not campaign_id_to_affect:
-            return updated_campaigns_list
+        action_instructions = f"""
+        Modify the campaign flow with ID '{flow_id_to_affect}' based on the user's prompt.
+        Only return the modified campaign flow object. Ensure its ID remains '{flow_id_to_affect}'.
+        """
+        flow_to_modify = next((flow for flow in updated_flows_list if flow.get("flow_id") == flow_id_to_affect), None)
+        if not flow_to_modify:
+            raise HTTPException(status_code=404, detail=f"Campaign flow with ID {flow_id_to_affect} not found.")
 
-        campaign_to_update = next((c for c in updated_campaigns_list if c.get('id') == campaign_id_to_affect), None)
-        if not campaign_to_update:
-            return updated_campaigns_list # Campaign not found in current memory
+        chain = campaign_flow_prompt | llm | parser
+        response_obj = await chain.invoke({
+            "user_prompt": user_prompt,
+            "available_audiences_json": json.dumps(available_audiences, indent=2),
+            "available_growth_levers_json": json.dumps(available_growth_levers, indent=2),
+            "current_campaign_flows_json": json.dumps([flow_to_modify], indent=2), # Pass only the relevant flow
+            "action_instructions": action_instructions,
+            "format_instructions": parser.get_format_instructions(),
+            "current_datetime": current_datetime
+        })
 
-        # To update a singular campaign, we need to provide its current context to the LLM.
-        # This means extracting the linked audience, growth lever, and product data from the UI's session.
-        # This requires the UI to pass these full objects or for these functions to fetch from read-only sources.
-        # For this refactor, we assume the UI provides enough context or the `fetch_from_supabase` is sufficient
-        # for these *read-only* lookups.
+        if response_obj.status == "success" and response_obj.suggested_flows:
+            modified_flow = response_obj.suggested_flows[0].model_dump(by_alias=True)
+            updated_flows_list = [
+                modified_flow if flow.get("flow_id") == flow_id_to_affect else flow
+                for flow in updated_flows_list
+            ]
+        else:
+            print(f"LLM did not return a modified campaign flow for ID {flow_id_to_affect}: {response_obj.message}. Original list returned.")
 
-        # Fetch full details of the linked entities from their respective tables (read-only context)
-        # Note: These are fetches for context for the LLM, not for saving/updating these tables.
-        selected_audience = (await fetch_from_supabase('audience_store', campaign_to_update.get('audience_id')))[0] if campaign_to_update.get('audience_id') else None
-        selected_growth_lever = (await fetch_from_supabase('growth_levers_store', campaign_to_update.get('growth_lever_id')))[0] if campaign_to_update.get('growth_lever_id') else None
-        selected_product = (await fetch_from_supabase('product_store', campaign_to_update.get('product_id')))[0] if campaign_to_update.get('product_id') else None
 
-        if not all([selected_audience, selected_growth_lever, selected_product]):
-            # print(f"ERROR: Linked audience, growth lever, or product data missing for campaign ID {campaign_id_to_affect}. Cannot update.") # Removed print
-            return updated_campaigns_list
+    elif action_type == "delete_singular":
+        if flow_id_to_affect:
+            updated_flows_list = [
+                flow for flow in updated_flows_list if flow.get("flow_id") != flow_id_to_affect
+            ]
+        else:
+            raise ValueError("Campaign Flow ID is required for delete_singular action.")
 
-        if not all([selected_audience, selected_growth_lever, selected_product]):
-            return updated_campaigns_list
+    elif action_type == "finalize":
+        if not updated_by_user_id:
+            raise ValueError("User ID is required for finalize action.")
 
-        llm_response_list = await call_llm_for_campaign_ideas(
-            api_key=API_KEY or "",
-            user_prompt=user_prompt,
-            selected_audience_data=selected_audience if selected_audience is not None else {},
-            selected_growth_lever_data=selected_growth_lever if selected_growth_lever is not None else {},
-            selected_product_data=selected_product if selected_product is not None else {},
-            current_campaign_ideas_for_llm=[campaign_to_update] # Send the specific campaign to modify
-        )
+        try:
+            data_to_save = []
+            for flow in updated_flows_list:
+                data_to_save.append({
+                    "flow_id": flow.get("flow_id"),
+                    "name": flow.get("name"),
+                    "description": flow.get("description"),
+                    "target_audience_id": flow.get("target_audience_id"),
+                    "growth_lever_id": flow.get("growth_lever_id"),
+                    "product_context": flow.get("product_context"),
+                    "flow_detail": json.dumps(flow.get("flow_detail", {})), # Store JSON as string
+                    "estimated_reach": flow.get("estimated_reach"),
+                    "expected_ctr": flow.get("expected_ctr"),
+                    "expected_conversion_rate": flow.get("expected_conversion_rate"),
+                    "user_id": updated_by_user_id,
+                    "timestamp": datetime.now().isoformat()
+                })
 
-        if llm_response_list:
-            updated_campaign_data = llm_response_list[0]
-            # Find and replace the updated campaign in the list
-            for i, camp in enumerate(updated_campaigns_list):
-                if camp.get('id') == campaign_id_to_affect:
-                    updated_campaign_data['id'] = campaign_id_to_affect # Preserve ID
-                    updated_campaigns_list[i] = updated_campaign_data
-                    break
-        return updated_campaigns_list
+            # --- IMPORTANT: Saving to 'campaigns' table as requested ---
+            # Ensure your Supabase project has a table named 'campaigns'
+            # with the appropriate schema for these flow campaigns.
+            response = supabase.table("campaigns").upsert(data_to_save, on_conflict="flow_id").execute()
 
-    elif action_type == "generate":
-        if not selected_combinations_data:
-            return updated_campaigns_list
+            if response.data:
+                print(f"Successfully saved {len(response.data)} campaign flows to Supabase 'campaigns' table.")
+            else:
+                print("No data returned after upsert to 'campaigns' table, check Supabase operation.")
 
-        for combo_data in selected_combinations_data:
-            selected_audience = combo_data.get('audience_data')
-            selected_growth_lever = combo_data.get('growth_lever_data')
-            selected_product = combo_data.get('product_data')
+        except Exception as e:
+            print(f"An unexpected error occurred during finalize action: {e}")
+            raise # Re-raise to ensure error is propagated if necessary
 
-            if not all([selected_audience, selected_growth_lever, selected_product]):
-                # print(f"Warning: Skipping combination due to incomplete data.") # Removed print
-                continue
+    # Enrich with audience_name and growth_lever_type for UI display before returning
+    final_formatted_flows = []
+    audience_map = {aud.get("id"): aud.get("name") for aud in available_audiences}
+    growth_lever_map = {gl.get("growth_lever_id"): gl.get("type") for gl in available_growth_levers}
 
-            generated_ideas = await call_llm_for_campaign_ideas(
-                api_key=API_KEY or "",
-                user_prompt=user_prompt,
-                selected_audience_data=selected_audience if selected_audience is not None else {},
-                selected_growth_lever_data=selected_growth_lever if selected_growth_lever is not None else {},
-                selected_product_data=selected_product if selected_product is not None else {},
-                current_campaign_ideas_for_llm=None
-            )
-            
-            if generated_ideas:
-                for idea in generated_ideas:
-                    if 'id' not in idea or not idea['id']:
-                        idea['id'] = str(uuid.uuid4())
-                    # Ensure IDs from the *selected combo* are correctly linked
-                    idea['audience_id'] = selected_audience.get('id') if selected_audience else None
-                    idea['growth_lever_id'] = selected_growth_lever.get('id') if selected_growth_lever else None
-                    idea['product_id'] = selected_product.get('id') if selected_product else None
-                    updated_campaigns_list.append(idea)
-        return updated_campaigns_list
-    
-    return updated_campaigns_list # Default return
+    for flow in updated_flows_list:
+        formatted_flow = {
+            "id": flow.get("flow_id"), # Ensure 'id' is present for UI consistency
+            "flow_id": flow.get("flow_id"),
+            "name": flow.get("name"),
+            "description": flow.get("description"),
+            "target_audience_id": flow.get("target_audience_id"),
+            "growth_lever_id": flow.get("growth_lever_id"),
+            "product_context": flow.get("product_context"),
+            "flow_detail": flow.get("flow_detail"),
+            "estimated_reach": flow.get("estimated_reach"),
+            "expected_ctr": flow.get("expected_ctr"),
+            "expected_conversion_rate": flow.get("expected_conversion_rate"),
+            "audience_name": audience_map.get(flow.get("target_audience_id"), "N/A"),
+            "growth_lever_type": growth_lever_map.get(flow.get("growth_lever_id"), "N/A"),
+        }
+        final_formatted_flows.append(formatted_flow)
 
-# Removed test_campaign_generator and if __name__ == "__main__": block
+    return final_formatted_flows
