@@ -6,17 +6,15 @@ import asyncio
 from datetime import datetime
 import random # Import random for inventing numbers
 
+from dotenv import load_dotenv
+load_dotenv() # Load environment variables from .env file
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 from supabase import create_client, Client
-from fastapi import HTTPException
-
-from dotenv import load_dotenv
-
-load_dotenv()  # Load environment variables from .env file
+from fastapi import HTTPException # Import HTTPException for proper error handling
 
 # --- Configuration ---
 API_KEY = os.getenv('OPENAI_API_KEY')
@@ -25,9 +23,11 @@ SUPABASE_ANON_KEY = os.getenv('SUPABASE_CLIENT_ANON_KEY')
 
 # Add a check to ensure they are loaded
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    # Use a more user-friendly error or log for production
     raise ValueError("SUPABASE_URL and SUPABASE_CLIENT_ANON_KEY environment variables must be set.")
 if not API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable must be set.")
+    # Use a more user-friendly error or log for production
+    raise ValueError("OPENAI_API_KEY environment variables must be set.")
 
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
@@ -89,7 +89,7 @@ async def orchestrate_audience_actions(
     audience_id_to_affect: Optional[str] = None,
     updated_by_user_id: Optional[str] = None,
     action_finalize: Optional[str] = None # Added for finalize action
-) -> List[Dict[str, Any]]:
+) -> List[Dict[str, Any]]: # Explicitly declare return type
     """
     Orchestrates actions related to audience types: generate (suggest), update, delete, or finalize (save to DB).
 
@@ -104,10 +104,20 @@ async def orchestrate_audience_actions(
     Returns:
         List[Dict[str, Any]]: The updated list of audience records for UI session memory.
     """
-    updated_audiences_list = [AudienceType(**aud).model_dump() if not isinstance(aud, AudienceType) else aud for aud in current_audiences]
+    # Ensure all incoming audience dictionaries conform to AudienceType schema for consistent processing
+    # Convert to AudienceType Pydantic objects first, then to dict for mutable list manipulation
+    updated_audiences_list: List[Dict[str, Any]] = []
+    for aud_data in current_audiences:
+        try:
+            # Handle potential case where rule is stringified JSON
+            if 'rule' in aud_data and isinstance(aud_data['rule'], str):
+                aud_data['rule'] = json.loads(aud_data['rule'])
+            updated_audiences_list.append(AudienceType(**aud_data).model_dump())
+        except Exception as e:
+            print(f"Warning: Could not parse existing audience data into AudienceType: {aud_data}. Error: {e}")
+            updated_audiences_list.append(aud_data) # Keep original if parsing fails
 
     current_datetime = datetime.now().isoformat()
-
     action_instructions = ""
 
     if action_type == "generate": # This will now act as 'suggest'
@@ -115,20 +125,26 @@ async def orchestrate_audience_actions(
         Generate new, distinct audience types based on the user's prompt. Do not regenerate existing ones unless explicitly asked to modify them.
         Provide at least 3-5 new, diverse audience types.
         """
-        chain = audience_prompt | llm | parser
-        response = await chain.invoke({
-            "user_prompt": user_prompt,
-            "current_audiences_json": json.dumps(current_audiences, indent=2),
-            "action_instructions": action_instructions,
-            "format_instructions": parser.get_format_instructions(),
-            "current_datetime": current_datetime
-        })
-        new_audiences = [aud.model_dump() for aud in response.suggested_audiences]
-        # Append new audiences, ensuring no duplicates if IDs are generated
-        existing_ids = {aud.get("id") for aud in updated_audiences_list if aud.get("id")}
-        for new_aud in new_audiences:
-            if new_aud.get("id") and new_aud["id"] not in existing_ids:
-                updated_audiences_list.append(new_aud)
+        try:
+            chain = audience_prompt | llm | parser
+            response: SuggestedAudiencesOutput = await chain.invoke({
+                "user_prompt": user_prompt,
+                "current_audiences_json": json.dumps(current_audiences, indent=2),
+                "action_instructions": action_instructions,
+                "format_instructions": parser.get_format_instructions(),
+                "current_datetime": current_datetime
+            })
+            new_audiences = [aud.model_dump() for aud in response.suggested_audiences]
+            # Append new audiences, ensuring no duplicates if IDs are generated
+            existing_ids = {aud.get("id") for aud in updated_audiences_list if aud.get("id")}
+            for new_aud in new_audiences:
+                if new_aud.get("id") and new_aud["id"] not in existing_ids:
+                    updated_audiences_list.append(new_aud)
+        except Exception as e:
+            # Log the full exception for debugging
+            print(f"Error during LLM generation for audiences: {e}")
+            raise HTTPException(status_code=500, detail=f"LLM generation failed for audiences: {e}")
+
 
     elif action_type == "update_singular":
         action_instructions = f"""
@@ -140,25 +156,29 @@ async def orchestrate_audience_actions(
         if not audience_to_modify:
             raise HTTPException(status_code=404, detail=f"Audience with ID {audience_id_to_affect} not found.")
 
-        # Temporarily use only the audience to be modified for focused LLM output
-        chain = audience_prompt | llm | parser
-        response = await chain.invoke({
-            "user_prompt": user_prompt,
-            "current_audiences_json": json.dumps([audience_to_modify], indent=2), # Pass only the relevant audience
-            "action_instructions": action_instructions,
-            "format_instructions": parser.get_format_instructions(),
-            "current_datetime": current_datetime
-        })
+        try:
+            # Temporarily use only the audience to be modified for focused LLM output
+            chain = audience_prompt | llm | parser
+            response: SuggestedAudiencesOutput = await chain.invoke({
+                "user_prompt": user_prompt,
+                "current_audiences_json": json.dumps([audience_to_modify], indent=2), # Pass only the relevant audience
+                "action_instructions": action_instructions,
+                "format_instructions": parser.get_format_instructions(),
+                "current_datetime": current_datetime
+            })
 
-        if response.suggested_audiences:
-            modified_audience = response.suggested_audiences[0].model_dump()
-            # Replace the old audience with the modified one
-            updated_audiences_list = [
-                modified_audience if aud.get("id") == audience_id_to_affect else aud
-                for aud in updated_audiences_list
-            ]
-        else:
-            print(f"LLM did not return a modified audience for ID {audience_id_to_affect}. Original list returned.")
+            if response.suggested_audiences:
+                modified_audience = response.suggested_audiences[0].model_dump()
+                # Replace the old audience with the modified one
+                updated_audiences_list = [
+                    modified_audience if aud.get("id") == audience_id_to_affect else aud
+                    for aud in updated_audiences_list
+                ]
+            else:
+                print(f"LLM did not return a modified audience for ID {audience_id_to_affect}. Original list returned.")
+        except Exception as e:
+            print(f"Error during LLM modification for audience {audience_id_to_affect}: {e}")
+            raise HTTPException(status_code=500, detail=f"LLM modification failed for audience: {e}")
 
 
     elif action_type == "delete_singular":
@@ -188,10 +208,10 @@ async def orchestrate_audience_actions(
                     "timestamp": datetime.now().isoformat()
                 })
 
-            response = supabase.table("audience_store").upsert(data_to_save, on_conflict="id").execute()
+            supabase_response = supabase.table("audience_store").upsert(data_to_save, on_conflict="id").execute()
 
-            if response.data:
-                print(f"Successfully saved {len(response.data)} audiences to Supabase.")
+            if supabase_response.data:
+                print(f"Successfully saved {len(supabase_response.data)} audiences to Supabase.")
             else:
                 print("No data returned after upsert, check Supabase operation.")
 
