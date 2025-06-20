@@ -52,8 +52,9 @@ class SuggestedAudiencesOutput(BaseModel):
 llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=SecretStr(API_KEY))
 parser = PydanticOutputParser(pydantic_object=SuggestedAudiencesOutput)
 
+# MODIFICATION: Updated prompt template to include new context variables
 audience_template = """
-You are an expert marketing strategist. Your task is to generate and refine audience types based on user prompts and existing audience data.
+You are an expert marketing strategist. Your task is to generate and refine audience types based on user prompts, existing audience data, and contextual information from the business, products, and features.
 
 Current Date and Time: {current_datetime}
 
@@ -64,17 +65,32 @@ Existing Audiences in Session (for context and modification if applicable):
 {current_audiences_json}
 ---
 
+---
+Business Context (for strategic alignment of audiences):
+{business_context_json}
+---
+
+---
+Products Available (for product-specific audience generation):
+{products_json}
+---
+
+---
+Features Available (for feature-specific audience generation):
+{features_json}
+---
+
 Based on the user's prompt, perform the following action:
 {action_instructions}
 
 When generating or updating, ensure each audience type has:
 - 'id': A unique identifier (if generating, create a new UUID; if updating, use the existing one).
 - 'type': A concise name (e.g., "Tech-Savvy Millennials").
-- 'rationale': Strategic justification.
-- 'rule': A JSON object for segmentation (e.g., {{"age_range": "25-40", "interests": ["technology", "gaming"]}}).
+- 'rationale': Strategic justification, explaining how this audience aligns with the provided context.
+- 'rule': A JSON object for segmentation (e.g., {{"age_range": "25-40", "interests": ["technology", "gaming"]}}), potentially informed by product/feature data.
 - 'audience_size': An estimated numerical size (invent if generating).
-- 'cohort_score': A numerical score between 0.0 and 1.0 (invent if generating).
-- 'cohort_rationale': Explanation for the cohort score.
+- 'cohort_score': A numerical score between 0.0 and 1.0 (invent if generating), reflecting its strategic importance based on business goals.
+- 'cohort_rationale': Explanation for the cohort score, relating it to business context, products, or features.
 
 {format_instructions}
 """
@@ -92,6 +108,7 @@ async def orchestrate_audience_actions(
 ) -> List[Dict[str, Any]]: # Explicitly declare return type
     """
     Orchestrates actions related to audience types: generate (suggest), update, delete, or finalize (save to DB).
+    Fetches contextual data from Supabase to inform LLM generation.
 
     Args:
         user_prompt (str): The prompt from the user.
@@ -120,19 +137,55 @@ async def orchestrate_audience_actions(
     current_datetime = datetime.now().isoformat()
     action_instructions = ""
 
+    # MODIFICATION: Fetch contextual data from Supabase
+    business_context_data = []
+    products_data = []
+    features_data = []
+
+    try:
+        # Fetch Business Context
+        business_context_response = supabase.table("business_context_store").select("*").execute()
+        business_context_data = business_context_response.data if business_context_response and business_context_response.data else []
+        print(f"Fetched {len(business_context_data)} records from business_context_store.")
+
+        # Fetch Product Store data
+        products_response = supabase.table("product_store").select("*").execute()
+        products_data = products_response.data if products_response and products_response.data else []
+        print(f"Fetched {len(products_data)} records from product_store.")
+
+        # Fetch Feature Store data (only feature_name and feature_type)
+        features_response = supabase.table("feature_store").select("feature_name,feature_type").execute()
+        features_data = features_response.data if features_response and features_response.data else []
+        print(f"Fetched {len(features_data)} records from feature_store.")
+
+    except Exception as e:
+        print(f"Error fetching contextual data from Supabase: {e}")
+        # Decide if this error should block the LLM call or just proceed without context
+        # For now, we'll let it proceed with empty lists for context
+        pass # Allow LLM generation to continue even if context fetch fails
+
+    # MODIFICATION: Convert fetched data to JSON strings for the prompt
+    business_context_json = json.dumps(business_context_data, indent=2) if business_context_data else "No business context available."
+    products_json = json.dumps(products_data, indent=2) if products_data else "No product data available."
+    features_json = json.dumps(features_data, indent=2) if features_data else "No feature data available (only feature_name, feature_type fetched)."
+
     if action_type == "generate": # This will now act as 'suggest'
         action_instructions = """
-        Generate new, distinct audience types based on the user's prompt. Do not regenerate existing ones unless explicitly asked to modify them.
-        Provide at least 3-5 new, diverse audience types.
+        Generate new, distinct audience types based on the user's prompt and the provided business, product, and feature context. Do not regenerate existing ones unless explicitly asked to modify them.
+        Provide at least 3-5 new, diverse audience types. Ensure the rationale and cohort score rationale clearly link to the provided context.
         """
         try:
             chain = audience_prompt | llm | parser
+            # MODIFICATION: Pass new context variables to ainvoke
             response: SuggestedAudiencesOutput = await chain.ainvoke({
                 "user_prompt": user_prompt,
                 "current_audiences_json": json.dumps(current_audiences, indent=2),
                 "action_instructions": action_instructions,
                 "format_instructions": parser.get_format_instructions(),
-                "current_datetime": current_datetime
+                "current_datetime": current_datetime,
+                "business_context_json": business_context_json, # New
+                "products_json": products_json,                   # New
+                "features_json": features_json                    # New
             })
             new_audiences = [aud.model_dump() for aud in response.suggested_audiences]
             # Append new audiences, ensuring no duplicates if IDs are generated
@@ -148,8 +201,9 @@ async def orchestrate_audience_actions(
 
     elif action_type == "update_singular":
         action_instructions = f"""
-        Modify the audience with ID '{audience_id_to_affect}' based on the user's prompt.
+        Modify the audience with ID '{audience_id_to_affect}' based on the user's prompt and the provided business, product, and feature context.
         Only return the modified audience object. Ensure its ID remains '{audience_id_to_affect}'.
+        Ensure the rationale and cohort score rationale clearly link to the provided context if applicable.
         """
         # Find the specific audience to modify
         audience_to_modify = next((aud for aud in updated_audiences_list if aud.get("id") == audience_id_to_affect), None)
@@ -159,12 +213,16 @@ async def orchestrate_audience_actions(
         try:
             # Temporarily use only the audience to be modified for focused LLM output
             chain = audience_prompt | llm | parser
+            # MODIFICATION: Pass new context variables to ainvoke
             response: SuggestedAudiencesOutput = await chain.ainvoke({
                 "user_prompt": user_prompt,
                 "current_audiences_json": json.dumps([audience_to_modify], indent=2), # Pass only the relevant audience
                 "action_instructions": action_instructions,
                 "format_instructions": parser.get_format_instructions(),
-                "current_datetime": current_datetime
+                "current_datetime": current_datetime,
+                "business_context_json": business_context_json, # New
+                "products_json": products_json,                   # New
+                "features_json": features_json                    # New
             })
 
             if response.suggested_audiences:
@@ -232,7 +290,7 @@ async def orchestrate_audience_actions(
             "estimated_size": aud.get("audience_size"),
             "estimated_conversion_rate": aud.get("estimated_conversion_rate", round(random.uniform(0.05, 0.25), 2)), # Retain if exists, else invent
             "rationale": aud.get("rationale"),
-            "top_features": aud.get("top_features", []),
+            "top_features": aud.get("top_features", []), # LLM might now generate these based on context
             "cohort_score": aud.get("cohort_score"),
             "cohort_rationale": aud.get("cohort_rationale"),
         })
