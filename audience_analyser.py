@@ -127,7 +127,7 @@ async def orchestrate_audience_actions(
         """
         try:
             chain = audience_prompt | llm | parser
-            response: SuggestedAudiencesOutput = await chain.invoke({
+            response: SuggestedAudiencesOutput = await chain.ainvoke({
                 "user_prompt": user_prompt,
                 "current_audiences_json": json.dumps(current_audiences, indent=2),
                 "action_instructions": action_instructions,
@@ -159,7 +159,7 @@ async def orchestrate_audience_actions(
         try:
             # Temporarily use only the audience to be modified for focused LLM output
             chain = audience_prompt | llm | parser
-            response: SuggestedAudiencesOutput = await chain.invoke({
+            response: SuggestedAudiencesOutput = await chain.ainvoke({
                 "user_prompt": user_prompt,
                 "current_audiences_json": json.dumps([audience_to_modify], indent=2), # Pass only the relevant audience
                 "action_instructions": action_instructions,
